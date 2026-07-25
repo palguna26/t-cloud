@@ -1,0 +1,41 @@
+{
+  "name": "@termyte/cloud",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:db": "vitest run test/database.test.ts",
+    "verify": "npm run check:contract && npm run typecheck && npm test && npm run build",
+    "check:contract": "node scripts/check-contract.mjs",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "worker": "node dist/worker.js",
+    "migrate": "node dist/migrate.js",
+    "demo:seed": "npm run build && node dist/demo-seed.js",
+    "demo:slack": "npm run build && node dist/demo-slack.js",
+    "plan:override": "node scripts/set-plan-override.mjs",
+    "capacity": "npm run build && node scripts/capacity-test.mjs"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.11",
+    "hono": "^4.10.8",
+    "pg": "^8.16.3",
+    "stripe": "^22.3.2",
+    "termyte": "file:vendor/termyte-contract",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/pg": "^8.15.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

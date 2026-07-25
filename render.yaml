@@ -1,0 +1,68 @@
+envVarGroups:
+  - name: termyte-shared
+    envVars:
+      - key: AGENT_TOKEN_PEPPER
+        generateValue: true
+
+services:
+  - type: web
+    name: termyte-api
+    runtime: docker
+    plan: starter
+    dockerCommand: node dist/server.js
+    preDeployCommand: node dist/migrate.js
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - fromGroup: termyte-shared
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_POOL_MAX
+        value: "20"
+      - key: PUBLIC_APP_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: CONNECTOR_ENCRYPTION_KEY
+        sync: false
+      - key: GITHUB_APP_SLUG
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: SLACK_CLIENT_ID
+        sync: false
+      - key: SLACK_CLIENT_SECRET
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: LINEAR_CLIENT_ID
+        sync: false
+      - key: LINEAR_CLIENT_SECRET
+        sync: false
+      - key: LINEAR_WEBHOOK_SECRET
+        sync: false
+
+  - type: worker
+    name: termyte-worker
+    runtime: docker
+    plan: starter
+    dockerCommand: node dist/worker.js
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - fromGroup: termyte-shared
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_POOL_MAX
+        value: "5"
+      - key: PUBLIC_APP_URL
+        sync: false

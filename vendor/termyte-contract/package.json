@@ -1,0 +1,23 @@
+{
+  "name": "termyte",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./protocol": {
+      "types": "./protocol.d.ts",
+      "import": "./protocol.js"
+    },
+    "./agent-sdk": {
+      "types": "./agent-sdk.d.ts",
+      "import": "./agent-sdk.js"
+    },
+    "./security/redaction": {
+      "types": "./security/redaction.d.ts",
+      "import": "./security/redaction.js"
+    }
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}
