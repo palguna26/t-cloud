@@ -56,6 +56,106 @@ Still requiring end-to-end hardening:
 - production deployment and secret configuration;
 - database-backed tests in CI rather than skipped local tests.
 
+## Coordinated roadmap
+
+Termyte Cloud is the source of truth for shared Work Threads, permissions,
+handoffs, Context Receipts, and outcomes. The local runtime remains the source
+of truth for private memory, repository state, and offline capture. Cloud must
+not become a second copy of the local memory database.
+
+### Phase 1: Canonical Work Thread identity
+
+- Accept and return stable external links for local tasks, sessions, episodes,
+  checkpoints, and handoffs.
+- Make link creation idempotent within a workspace and agent identity.
+- Expose link state in the admin Work Thread detail response.
+- Audit link creation, replacement, and removal.
+
+Acceptance:
+
+- two agent platforms can link their local state to one Cloud Work Thread;
+- one local object cannot silently point to two active Work Threads;
+- deleting a local link does not delete the Cloud Work Thread.
+
+### Phase 2: Shared state and evidence contract
+
+- Extend the existing event protocol only where required to represent verified
+  checkpoints, tests, failures, files changed, and final outcomes.
+- Keep source events immutable and project updates through the worker.
+- Preserve the local source ID, agent identity, session, Work Thread, and
+  occurrence time on every projected fact.
+- Reject unsupported protocol versions and mismatched Work Thread links.
+
+Acceptance:
+
+- each local fact can be traced to one immutable Source Event;
+- duplicate batches do not change Work Thread state twice;
+- a second agent resolves the updated state after worker projection.
+
+### Phase 3: Canonical handoffs
+
+- Treat the Cloud handoff ID and state as authoritative for connected work.
+- Return enough data for the runtime to cache, claim, expire, revoke, and
+  reconcile a handoff without inventing another identity.
+- Complete a claimed handoff only from an accepted outcome or an explicit human
+  action.
+
+Acceptance:
+
+- create and claim remain atomic and idempotent;
+- expired, revoked, or already claimed handoffs cannot deliver context;
+- the dashboard and both runtimes show the same handoff state.
+
+### Phase 4: Context resolution quality
+
+- First prefer explicit Work Thread and handoff IDs, then recent participation,
+  repository scope, and lexical matching.
+- Record score inputs and the reason for resolved, clarification, or not-found
+  decisions.
+- Build a small labelled evaluation set from real prompts before adding vector
+  search or model-based routing.
+- Add semantic retrieval only when the evaluation proves PostgreSQL search is
+  the limiting factor.
+
+Acceptance:
+
+- evaluation reports wrong-thread rate, abstention rate, and clarification rate;
+- every automatic match has inspectable resolution evidence;
+- weak or close matches abstain instead of guessing.
+
+### Phase 5: Privacy and administration
+
+- Store the upload policy active at event receipt time.
+- Reject fields disabled by workspace policy even if an old runtime sends them.
+- Add admin views for failed and dead jobs, device revocation, retention, export,
+  and deletion progress.
+- Keep demo authentication impossible to enable accidentally in production.
+
+Acceptance:
+
+- server-side policy tests cover prompts, tool output, paths, and responses;
+- operators can retry or dismiss failed jobs with an audit event;
+- export and deletion tests run against PostgreSQL in CI.
+
+### Phase 6: Production and cross-agent proof
+
+- Run all PostgreSQL integration tests in CI.
+- Add one API-plus-worker test covering Slack intent, Codex execution, handoff,
+  Claude context delivery, receipt acknowledgement, and final outcome.
+- Test worker restart, duplicate delivery, expired credentials, revoked grants,
+  and temporary database failure.
+- Measure queue age, projection failures, context-resolution states, and receipt
+  acknowledgement latency.
+
+Release gate:
+
+1. empty-database migration succeeds;
+2. all database tests run rather than skip;
+3. the packed local runtime completes the two-agent flow;
+4. no event or Context Receipt crosses workspace or grant boundaries;
+5. failed delivery is visible and recoverable;
+6. rollback and backup restoration are tested.
+
 ## Core data model
 
 ### Work Thread
