@@ -972,6 +972,36 @@ export function createApp(
           event.source.platform,
           event.occurred_at,
         ]);
+        const internalSessionId = sessionId(principal.agentIdentityId, event.agent_session_id);
+        let internalWorkThreadId = (await client.query<{ bound_work_thread_id: string | null }>(`
+          SELECT bound_work_thread_id FROM agent_sessions WHERE id = $1
+        `, [internalSessionId])).rows[0]?.bound_work_thread_id ?? null;
+        if (!internalWorkThreadId && event.repository_key) {
+          internalWorkThreadId = (await client.query<{ id: string }>(`
+            SELECT id FROM work_threads
+            WHERE workspace_id = $1 AND repository_key = $2 AND deleted_at IS NULL
+              AND status IN ('proposed','active','blocked','in_review')
+            ORDER BY updated_at DESC LIMIT 1
+          `, [principal.workspaceId, event.repository_key])).rows[0]?.id ?? null;
+        }
+        if (!internalWorkThreadId) {
+          internalWorkThreadId = randomUUID();
+          await client.query(`
+            INSERT INTO work_threads (id, workspace_id, title, objective, status, repository_key, idempotency_key, created_by_agent_identity_id)
+            VALUES ($1, $2, $3, $4, 'proposed', $5, $6, $7)
+          `, [internalWorkThreadId, principal.workspaceId,
+            (event.content ?? event.event_type).slice(0, 500),
+            (event.content ?? event.event_type).slice(0, 10_000),
+            event.repository_key ?? null, `session:${internalSessionId}`, principal.agentIdentityId]);
+          await client.query(`
+            INSERT INTO work_thread_agent_grants (id, workspace_id, work_thread_id, agent_identity_id, source)
+            VALUES ($1, $2, $3, $4, 'automatic') ON CONFLICT DO NOTHING
+          `, [randomUUID(), principal.workspaceId, internalWorkThreadId, principal.agentIdentityId]);
+        }
+        await client.query(`
+          UPDATE agent_sessions SET bound_work_thread_id = $1, binding_source = 'resolved', bound_at = COALESCE(bound_at, now())
+          WHERE id = $2
+        `, [internalWorkThreadId, internalSessionId]);
         const proposedEntityId = randomUUID();
         await client.query(`
           INSERT INTO source_entities (
@@ -983,7 +1013,7 @@ export function createApp(
           principal.workspaceId,
           event.source.platform,
           event.event_id,
-          event.work_thread_id ?? null,
+          internalWorkThreadId,
         ]);
         const sourceEntityId = (await client.query<{ id: string }>(`
           SELECT id FROM source_entities
@@ -1004,7 +1034,7 @@ export function createApp(
         `, [
           randomUUID(),
           principal.workspaceId,
-          event.work_thread_id ?? null,
+          internalWorkThreadId,
           principal.agentIdentityId,
           sessionId(principal.agentIdentityId, event.agent_session_id),
           event.source.platform,
@@ -1024,7 +1054,7 @@ export function createApp(
             WHERE id = $2
           `, [inserted.rows[0].id, sourceEntityId]);
         }
-        if (inserted.rows[0] && event.work_thread_id) {
+        if (inserted.rows[0]) {
           await client.query(`
             INSERT INTO jobs (
               id, workspace_id, kind, dedupe_key, payload_json, state

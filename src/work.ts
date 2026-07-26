@@ -708,7 +708,16 @@ export async function reportOutcome(
   return transaction(db, async (client) => {
     const sanitized = redactValue(input, "outcome");
     input = sanitized.value;
-    const work = await permittedWork(client, principal, input.work_thread_id, "can_append_events");
+    const sessionBinding = await loadSessionBinding(client, principal, input.agent_session_id);
+    const receiptWork = input.receipt_id
+      ? (await client.query<{ work_thread_id: string }>(`
+          SELECT work_thread_id FROM context_receipts
+          WHERE id = $1 AND workspace_id = $2 AND agent_identity_id = $3
+        `, [input.receipt_id, principal.workspaceId, principal.agentIdentityId])).rows[0]?.work_thread_id
+      : null;
+    const internalWorkThreadId = receiptWork ?? sessionBinding?.bound_work_thread_id ?? input.work_thread_id;
+    if (!internalWorkThreadId) throw new NotFoundError();
+    const work = await permittedWork(client, principal, internalWorkThreadId, "can_append_events");
     if (!work) throw new NotFoundError();
     await ensureSession(client, principal, input.agent_session_id);
     if (input.receipt_id) {
@@ -726,7 +735,7 @@ export async function reportOutcome(
     `, [principal.workspaceId, input.idempotency_key]);
     let outcomeId = existing.rows[0]?.id as string | undefined;
     if (existing.rows[0] && (
-      existing.rows[0].work_thread_id !== input.work_thread_id
+      existing.rows[0].work_thread_id !== internalWorkThreadId
       || existing.rows[0].receipt_id !== (input.receipt_id ?? null)
       || existing.rows[0].agent_session_id
         !== sessionId(principal.agentIdentityId, input.agent_session_id)
