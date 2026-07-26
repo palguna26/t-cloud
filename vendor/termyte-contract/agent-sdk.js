@@ -1,4 +1,4 @@
-import { AcknowledgeReceiptResponseSchema, ClaimHandoffResponseSchema, CreateHandoffResponseSchema, CreateWorkResponseSchema, EventBatchResponseSchema, DeviceAuthorizationPollResponseSchema, DeviceAuthorizationStartResponseSchema, ProtocolErrorSchema, ReportOutcomeResponseSchema, ResolveContextResponseSchema, TERMYTE_PROTOCOL_VERSION, parseProtocol, } from "./protocol.js";
+import { AcknowledgeReceiptResponseSchema, ClaimHandoffResponseSchema, CreateHandoffResponseSchema, CreateWorkResponseSchema, DeviceAuthorizationPollResponseSchema, DeviceAuthorizationStartResponseSchema, EventBatchResponseSchema, ProtocolErrorSchema, RefreshContextResponseSchema, ReportOutcomeResponseSchema, ResolveContextResponseSchema, TERMYTE_PROTOCOL_VERSION, parseProtocol, } from "./protocol.js";
 export class TermyteCloudError extends Error {
     code;
     status;
@@ -38,6 +38,9 @@ export class TermyteAgentClient {
     }
     resolveContext(input) {
         return this.request("/v1/context/resolve", input, ResolveContextResponseSchema);
+    }
+    refreshContext(input) {
+        return this.request("/v1/context/refresh", input, RefreshContextResponseSchema);
     }
     acknowledgeReceipt(receiptId, input) {
         return this.request(`/v1/receipts/${encodeURIComponent(receiptId)}/ack`, input, AcknowledgeReceiptResponseSchema);

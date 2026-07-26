@@ -1,10 +1,30 @@
 import { z } from "zod";
-export const TERMYTE_PROTOCOL_VERSION = 1;
+export const TERMYTE_PROTOCOL_VERSION = 2;
 const id = z.string().trim().min(1).max(200);
 const text = z.string().trim().min(1).max(100_000);
 const shortText = z.string().trim().min(1).max(500);
 const timestamp = z.number().int().nonnegative();
 const metadata = z.record(z.string(), z.unknown());
+const taskMode = z.enum([
+    "implement",
+    "investigate",
+    "review",
+    "verify",
+    "continue",
+    "general",
+]);
+const receiptType = z.enum([
+    "initial",
+    "delta",
+    "full_refresh",
+    "cached_fallback",
+]);
+const deliveryStatus = z.enum([
+    "pending",
+    "delivered",
+    "failed",
+    "expired",
+]);
 const versioned = {
     schema_version: z.literal(TERMYTE_PROTOCOL_VERSION),
 };
@@ -143,6 +163,8 @@ export const ResolveContextRequestSchema = z.object({
     agent_session_id: id,
     work_thread_id: id.optional(),
     handoff_id: id.optional(),
+    selection_token: id.optional(),
+    task_mode_hint: taskMode.optional(),
     repository_key: shortText.optional(),
     branch: shortText.optional(),
     recent_work_thread_ids: z.array(id).max(20).optional(),
@@ -158,6 +180,8 @@ export const ContextSourceSchema = z.object({
 export const ResolvedContextResponseSchema = z.object({
     ...versioned,
     state: z.literal("resolved"),
+    receipt_type: receiptType,
+    task_mode: taskMode,
     work_thread_id: id,
     work_thread_version: z.number().int().positive(),
     receipt_id: id,
@@ -171,7 +195,7 @@ export const ClarificationContextResponseSchema = z.object({
     state: z.literal("clarification_required"),
     question: shortText,
     candidates: z.array(z.object({
-        work_thread_id: id,
+        selection_token: id,
         label: shortText,
     }).strict()).min(2).max(3),
 }).strict();
@@ -185,15 +209,60 @@ export const ResolveContextResponseSchema = z.discriminatedUnion("state", [
     ClarificationContextResponseSchema,
     NotFoundContextResponseSchema,
 ]);
-export const AcknowledgeReceiptRequestSchema = z.object({
+const AcknowledgeDeliveredReceiptRequestSchema = z.object({
     ...versioned,
+    delivery_status: z.literal("delivered"),
     delivered_at: timestamp,
     idempotency_key: id,
 }).strict();
+const AcknowledgeFailedReceiptRequestSchema = z.object({
+    ...versioned,
+    delivery_status: z.literal("failed"),
+    failure_code: shortText,
+    idempotency_key: id,
+}).strict();
+export const AcknowledgeReceiptRequestSchema = z.discriminatedUnion("delivery_status", [
+    AcknowledgeDeliveredReceiptRequestSchema,
+    AcknowledgeFailedReceiptRequestSchema,
+]);
 export const AcknowledgeReceiptResponseSchema = z.object({
     ...versioned,
     acknowledged: z.literal(true),
 }).strict();
+export const RefreshContextRequestSchema = z.object({
+    ...versioned,
+    previous_receipt_id: id,
+    request_text: text,
+    agent_session_id: id,
+    task_mode_hint: taskMode.optional(),
+    token_budget: z.number().int().min(256).max(8_000).default(2_000),
+    idempotency_key: id,
+}).strict();
+export const PendingRefreshContextResponseSchema = z.object({
+    ...versioned,
+    state: z.literal("pending"),
+    message: shortText,
+    retry_after_ms: z.number().int().positive(),
+}).strict();
+export const UnchangedRefreshContextResponseSchema = z.object({
+    ...versioned,
+    state: z.literal("unchanged"),
+    work_thread_id: id,
+    work_thread_version: z.number().int().positive(),
+    receipt_id: id,
+    expires_at: timestamp,
+}).strict();
+export const BindingLostContextResponseSchema = z.object({
+    ...versioned,
+    state: z.literal("binding_lost"),
+    message: shortText,
+}).strict();
+export const RefreshContextResponseSchema = z.discriminatedUnion("state", [
+    ResolvedContextResponseSchema,
+    PendingRefreshContextResponseSchema,
+    UnchangedRefreshContextResponseSchema,
+    BindingLostContextResponseSchema,
+]);
 export const ReportOutcomeRequestSchema = z.object({
     ...versioned,
     work_thread_id: id,

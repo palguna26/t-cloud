@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type pg from "pg";
 import { loadConfig } from "./config.js";
@@ -6,6 +6,7 @@ import { createDatabase, transaction, type Database } from "./db.js";
 import { processStripeEvent } from "./billing.js";
 import type Stripe from "stripe";
 import { connectorKey, syncSlackThread, type ConnectorRuntime } from "./connectors.js";
+import { synthesizeSlackThread } from "./synthesis.js";
 
 export interface Job {
   id: string;
@@ -14,6 +15,18 @@ export interface Job {
   payload_json: Record<string, unknown>;
   attempts: number;
   max_attempts: number;
+}
+
+interface ProjectedContextItem {
+  type: string;
+  text: string;
+  authority: number;
+  confidence: number;
+}
+
+interface ProjectedItemBatch {
+  items: ProjectedContextItem[];
+  fallbackReason?: string;
 }
 
 export async function claimJob(db: Database, workerId: string): Promise<Job | null> {
@@ -65,7 +78,11 @@ async function fail(client: pg.PoolClient, job: Job, error: unknown): Promise<vo
   ]);
 }
 
-async function projectEvent(db: Database, job: Job): Promise<void> {
+async function projectEvent(
+  db: Database,
+  job: Job,
+  connectorRuntime?: ConnectorRuntime,
+): Promise<void> {
   const sourceEventId = job.payload_json["source_event_id"];
   if (typeof sourceEventId !== "string") throw new Error("project_event requires source_event_id");
   await transaction(db, async (client) => {
@@ -73,36 +90,81 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
       id: string;
       workspace_id: string;
       work_thread_id: string | null;
+      link_work_thread_id: string | null;
       agent_identity_id: string | null;
       agent_session_id: string | null;
       source: string;
       event_type: string;
+      payload_json: Record<string, unknown>;
       payload_text: string | null;
       source_entity_id: string | null;
       current_source_event_id: string | null;
     }>(`
       SELECT event.id, event.workspace_id,
-        coalesce(entity.work_thread_id, event.work_thread_id) AS work_thread_id,
+        coalesce(entity.work_thread_id, event.work_thread_id, link.work_thread_id) AS work_thread_id,
+        link.work_thread_id AS link_work_thread_id,
         event.agent_identity_id, event.agent_session_id, event.source,
-        event.event_type, event.payload_text, event.source_entity_id,
-        entity.current_source_event_id
+        event.event_type, event.payload_json, event.payload_text,
+        event.source_entity_id, entity.current_source_event_id
       FROM source_events event
       LEFT JOIN source_entities entity ON entity.id = event.source_entity_id
+      LEFT JOIN LATERAL (
+        SELECT source_event_links.work_thread_id
+        FROM source_event_links
+        WHERE source_event_links.source_event_id = event.id
+        ORDER BY source_event_links.created_at DESC
+        LIMIT 1
+      ) link ON true
       WHERE event.id = $1
+      FOR UPDATE OF event, entity
     `, [sourceEventId]);
     const event = result.rows[0];
-    if (!event?.work_thread_id || !event.payload_text) return;
-    if (event.source_entity_id && event.current_source_event_id !== event.id) return;
-    const type = PROJECTED_TYPES[event.event_type];
-    if (!type) return;
-
+    if (!event?.work_thread_id) return;
+    const workThreadId = event.work_thread_id;
+    const payloadText = event.payload_text ?? String(event.payload_json["text"] ?? "");
+    if (!payloadText) return;
+    if (event.source_entity_id && event.current_source_event_id && event.current_source_event_id !== event.id) return;
+    const workThread = (await client.query<{
+      id: string;
+      title: string;
+      objective: string;
+      status: string;
+    }>(`
+      SELECT id, title, objective, status
+      FROM work_threads
+      WHERE id = $1 AND workspace_id = $2
+    `, [event.work_thread_id, event.workspace_id])).rows[0];
+    if (!workThread) return;
     const finalResponse = event.event_type === "session_ended";
-    const projections = event.source === "slack"
-      ? projectSlackIntent(event.payload_text)
-      : [{
-          type,
-          text: finalResponse ? `Agent final response: ${event.payload_text}` : event.payload_text,
-        }];
+    const activeItems = (await client.query<{
+      id: string;
+      type: string;
+      text: string;
+      authority: number;
+    }>(`
+      SELECT id, type, text, authority
+      FROM context_items
+      WHERE workspace_id = $1 AND work_thread_id = $2
+        AND state = 'active'
+        AND (valid_until IS NULL OR valid_until > now())
+      ORDER BY authority DESC, updated_at DESC
+      LIMIT 100
+    `, [event.workspace_id, workThread.id])).rows;
+    const projectionResult = event.source === "slack"
+      ? await projectSlackSnapshot({
+        id: event.id,
+        workspace_id: event.workspace_id,
+        work_thread_id: workThreadId,
+        source_entity_id: event.source_entity_id,
+        payload_json: event.payload_json,
+        payload_text: payloadText,
+      }, workThread, activeItems, connectorRuntime)
+      : { items: projectAgentEvent({
+        event_type: event.event_type,
+        payload_text: payloadText,
+        payload_json: event.payload_json,
+      }) };
+    if (projectionResult.items.length === 0) return;
     if (event.source_entity_id) {
       await client.query(`
         UPDATE context_items item SET state = 'superseded', updated_at = now()
@@ -115,32 +177,71 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
         )
       `, [event.source_entity_id, event.workspace_id, event.id]);
     }
-    for (const [index, projection] of projections.entries()) {
+    let materialChange = false;
+    for (const [index, projection] of projectionResult.items.entries()) {
+      const normalizedHash = hashProjection(projection.type, projection.text);
+      const existing = (await client.query<{
+        id: string;
+        type: string;
+        text: string;
+      }>(`
+        SELECT id, type, text
+        FROM context_items
+        WHERE workspace_id = $1 AND work_thread_id = $2
+          AND normalized_hash = $3 AND state = 'active'
+        ORDER BY updated_at DESC
+        LIMIT 1
+        FOR UPDATE
+      `, [event.workspace_id, workThread.id, normalizedHash])).rows[0];
+      if (existing && existing.type === projection.type && existing.text === projection.text) {
+        await client.query(`
+          INSERT INTO context_item_sources (
+            context_item_id, source_event_id, relationship
+          ) VALUES ($1, $2, $3)
+          ON CONFLICT DO NOTHING
+        `, [existing.id, sourceEventId, `derived:${index}`]);
+        materialChange = true;
+        continue;
+      }
+      if (existing) {
+        await client.query(`
+          UPDATE context_items
+          SET state = 'superseded', updated_at = now()
+          WHERE id = $1
+        `, [existing.id]);
+      }
       const contextItemId = randomUUID();
       await client.query(`
         INSERT INTO context_items (
           id, workspace_id, work_thread_id, type, text, authority,
-          confidence, state, created_by_agent_identity_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)
+          confidence, state, created_by_agent_identity_id,
+          supersedes_context_item_id, normalized_hash, projector_version
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, 2)
       `, [
         contextItemId,
         event.workspace_id,
         event.work_thread_id,
         projection.type,
         projection.text,
-        finalResponse ? 2 : 3,
-        finalResponse ? 0.8 : 1,
+        projection.authority,
+        projection.confidence,
         event.agent_identity_id,
+        existing?.id ?? null,
+        normalizedHash,
       ]);
       await client.query(`
-        INSERT INTO context_item_sources (context_item_id, source_event_id, relationship)
-        VALUES ($1, $2, $3)
+        INSERT INTO context_item_sources (
+          context_item_id, source_event_id, relationship
+        ) VALUES ($1, $2, $3)
       `, [contextItemId, sourceEventId, `derived:${index}`]);
+      materialChange = true;
     }
-    await client.query(`
-      UPDATE work_threads SET version = version + 1, updated_at = now()
-      WHERE id = $1 AND workspace_id = $2
-    `, [event.work_thread_id, event.workspace_id]);
+    if (materialChange) {
+      await client.query(`
+        UPDATE work_threads SET version = version + 1, updated_at = now()
+        WHERE id = $1 AND workspace_id = $2
+      `, [event.work_thread_id, event.workspace_id]);
+    }
     if (finalResponse && event.agent_session_id) {
       await client.query(`
         UPDATE handoffs
@@ -148,6 +249,22 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
         WHERE workspace_id = $1 AND work_thread_id = $2
           AND claimed_by_session_id = $3 AND status = 'claimed'
       `, [event.workspace_id, event.work_thread_id, event.agent_session_id]);
+    }
+    if (projectionResult.fallbackReason) {
+      await client.query(`
+        INSERT INTO audit_events (
+          id, workspace_id, actor_type, actor_id, action,
+          target_type, target_id, metadata_json
+        ) VALUES ($1, $2, 'system', 'worker', 'projection.fallback', 'source_event', $3, $4)
+      `, [
+        randomUUID(),
+        event.workspace_id,
+        event.id,
+        {
+          source_event_id: event.id,
+          fallback_reason: projectionResult.fallbackReason,
+        },
+      ]);
     }
   });
 }
@@ -230,18 +347,141 @@ export function projectSlackIntent(text: string): Array<{ type: string; text: st
   return result;
 }
 
+function projectAgentEvent(event: {
+  event_type: string;
+  payload_text: string;
+  payload_json: Record<string, unknown>;
+}): ProjectedContextItem[] {
+  const text = event.payload_text.trim();
+  switch (event.event_type) {
+    case "user_prompt":
+      return [{
+        type: /^(continue|next|please|do|run|check|review)\b/i.test(text) ? "next_action" : "objective",
+        text,
+        authority: 2,
+        confidence: 1,
+      }];
+    case "action":
+      return [{ type: "observation", text, authority: 2, confidence: 1 }];
+    case "attempt":
+      return [{ type: "attempt", text, authority: 2, confidence: 1 }];
+    case "failure":
+      return [{ type: "failure", text, authority: 3, confidence: 1 }];
+    case "evidence":
+      return [{
+        type: /\b(pass(?:ed)?|succeeded|verified|green)\b/i.test(text) ? "evidence" : "observation",
+        text,
+        authority: /\b(pass(?:ed)?|succeeded|verified|green)\b/i.test(text) ? 4 : 2,
+        confidence: 1,
+      }];
+    case "decision":
+      return [{ type: "decision", text, authority: 4, confidence: 1 }];
+    case "constraint":
+      return [{ type: "constraint", text, authority: 4, confidence: 1 }];
+    case "status_changed":
+      return [{ type: "current_state", text, authority: 3, confidence: 1 }];
+    case "session_ended":
+      return [{ type: "outcome", text: `Agent final response: ${text}`, authority: 2, confidence: 0.8 }];
+    case "outcome":
+      return [{ type: "outcome", text, authority: 4, confidence: 1 }];
+    default:
+      return [{ type: "observation", text, authority: 2, confidence: 1 }];
+  }
+}
+
+async function projectSlackSnapshot(
+  event: {
+    id: string;
+    workspace_id: string;
+    work_thread_id: string;
+    source_entity_id: string | null;
+    payload_json: Record<string, unknown>;
+    payload_text: string;
+  },
+  workThread: {
+    id: string;
+    title: string;
+    objective: string;
+    status: string;
+  },
+  activeItems: Array<{
+    id: string;
+    type: string;
+    text: string;
+    authority: number;
+  }>,
+  connectorRuntime?: ConnectorRuntime,
+): Promise<ProjectedItemBatch> {
+  const raw = event.payload_json["raw"] as { messages?: Array<Record<string, unknown>>; thread_ts?: string } | undefined;
+  const messages = (raw?.messages ?? []).map((message, index) => ({
+    ts: String(message.ts ?? index),
+    thread_ts: String(message.thread_ts ?? raw?.thread_ts ?? message.ts ?? index),
+    user: message.user ? String(message.user) : null,
+    text: String(message.text ?? ""),
+    occurred_at: String(message.occurred_at ?? ""),
+    edited_at: message.edited_at ? String(message.edited_at) : null,
+  })).filter((message) => message.text.length > 0);
+  const sourceRefs = messages.map((message, index) =>
+    `${event.source_entity_id ?? event.id}:${message.ts}:${index}`);
+  const synthesis = await synthesizeSlackThread({
+    workThread,
+    activeContextItems: activeItems,
+    snapshot: {
+      entityKey: String(event.payload_json["entityKey"] ?? event.id),
+      threadTs: String(raw?.thread_ts ?? messages[0]?.thread_ts ?? ""),
+      messages,
+    },
+    allowedTypes: [
+      "objective",
+      "current_state",
+      "decision",
+      "constraint",
+      "observation",
+      "attempt",
+      "failure",
+      "blocker",
+      "evidence",
+      "expected_result",
+      "next_action",
+      "outcome",
+    ],
+    sourceRefs,
+  }, connectorRuntime?.synthesis ?? {});
+  return {
+    items: synthesis.candidates.map((candidate) => ({
+      type: candidate.type,
+      text: candidate.text,
+      authority: candidate.confidence >= 0.9 ? 4 : candidate.confidence >= 0.7 ? 3 : 2,
+      confidence: candidate.confidence,
+    })),
+    fallbackReason: synthesis.fallback_reason,
+  };
+}
+
+function hashProjection(type: string, text: string): string {
+  return createHash("sha256")
+    .update(type.trim().toLowerCase())
+    .update("\0")
+    .update(text.trim().replace(/\s+/g, " "))
+    .digest("hex");
+}
+
 export async function runOneJob(
   db: Database,
   workerId: string,
-  connectorRuntime?: Pick<ConnectorRuntime, "encryptionKey" | "fetch">,
+  connectorRuntime?: ConnectorRuntime,
 ): Promise<boolean> {
   const job = await claimJob(db, workerId);
   if (!job) return false;
   try {
-    if (job.kind === "project_event") await projectEvent(db, job);
+    if (job.kind === "project_event") await projectEvent(db, job, connectorRuntime);
     else if (job.kind === "sync_slack_thread") {
       if (!connectorRuntime) throw new Error("Slack connector runtime is not configured");
-      await syncSlackThread(db, job.payload_json, connectorRuntime);
+      await syncSlackThread(
+        db,
+        job.payload_json,
+        connectorRuntime as Pick<ConnectorRuntime, "encryptionKey" | "fetch">,
+      );
     }
     else if (job.kind === "enforce_retention") await enforceRetention(db, job);
     else if (job.kind === "delete_workspace") await deleteWorkspace(db, job);
@@ -261,7 +501,18 @@ export async function runWorker(signal?: AbortSignal): Promise<void> {
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
   const workerId = randomUUID();
   const connectorRuntime = config.CONNECTOR_ENCRYPTION_KEY
-    ? { encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY) }
+    ? {
+        encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY),
+        webhookSecrets: {},
+        synthesis: config.CONTEXT_SYNTHESIS_BASE_URL && config.CONTEXT_SYNTHESIS_API_KEY && config.CONTEXT_SYNTHESIS_MODEL
+          ? {
+              baseUrl: config.CONTEXT_SYNTHESIS_BASE_URL,
+              apiKey: config.CONTEXT_SYNTHESIS_API_KEY,
+              model: config.CONTEXT_SYNTHESIS_MODEL,
+              timeoutMs: config.CONTEXT_SYNTHESIS_TIMEOUT_MS,
+            }
+          : undefined,
+      }
     : undefined;
   let nextRetentionSweep = 0;
   try {

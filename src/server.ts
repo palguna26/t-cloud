@@ -16,6 +16,7 @@ import {
   DeviceAuthorizationStartRequestSchema,
   ReportOutcomeRequestSchema,
   ResolveContextRequestSchema,
+  RefreshContextRequestSchema,
   TERMYTE_PROTOCOL_VERSION,
   parseProtocol,
 } from "termyte/protocol";
@@ -35,6 +36,7 @@ import {
   createWork,
   reportOutcome,
   resolveContext,
+  refreshContext,
   sessionId,
 } from "./work.js";
 import {
@@ -919,18 +921,19 @@ export function createApp(
     let redactedEventIds = new Set<string>();
     try {
       const parsed = parseProtocol(EventBatchRequestSchema, await context.req.json());
-      const sanitized = parsed.events.map((event) => redactValue(event, "event"));
+      const sanitized = (parsed.events as Array<any>)
+        .map((event: any) => redactValue(event, "event") as any);
       redactedEventIds = new Set(sanitized
-        .filter((result) => result.redaction.applied)
-        .map((result) => result.value.event_id));
+        .filter((result: any) => result.redaction.applied)
+        .map((result: any) => String(result.value.event_id)));
       batch = {
         ...parsed,
-        events: sanitized.map((result) => result.value),
+        events: sanitized.map((result: any) => result.value),
       };
     } catch {
       return context.json(protocolError("INVALID_ARGUMENT", "Invalid event batch", context.get("requestId")), 400);
     }
-    if (batch.events.some((event) => event.source.platform !== principal.platform)) {
+    if ((batch.events as any[]).some((event: any) => event.source.platform !== principal.platform)) {
       return context.json(protocolError(
         "INVALID_ARGUMENT",
         "Event source does not match the authenticated Agent Identity",
@@ -940,7 +943,7 @@ export function createApp(
     const result = await transaction(db, async (client) => {
       const accepted: string[] = [];
       const existing: string[] = [];
-      for (const event of batch.events) {
+      for (const event of batch.events as any[]) {
         if (event.work_thread_id) {
           const grant = await client.query(`
             SELECT can_append_events
@@ -1111,10 +1114,25 @@ export function createApp(
     }
     try {
       const input = parseProtocol(AcknowledgeReceiptRequestSchema, await context.req.json());
-      return context.json(await acknowledgeReceipt(db, principal, context.req.param("id"), input.delivered_at));
+      return context.json(await acknowledgeReceipt(db, principal, context.req.param("id"), input));
     } catch (error) {
       if (error instanceof SyntaxError || isValidationError(error)) {
         return context.json(protocolError("INVALID_ARGUMENT", "Invalid receipt acknowledgement", context.get("requestId")), 400);
+      }
+      throw error;
+    }
+  });
+  app.post("/v1/context/refresh", async (context) => {
+    const principal = context.get("principal");
+    if (!hasScope(principal, "context:read")) {
+      return context.json(protocolError("FORBIDDEN", "Credential lacks context:read", context.get("requestId")), 403);
+    }
+    try {
+      const input = parseProtocol(RefreshContextRequestSchema, await context.req.json());
+      return context.json(await refreshContext(db, principal, input));
+    } catch (error) {
+      if (error instanceof SyntaxError || isValidationError(error)) {
+        return context.json(protocolError("INVALID_ARGUMENT", "Invalid context refresh request", context.get("requestId")), 400);
       }
       throw error;
     }

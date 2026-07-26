@@ -4,8 +4,8 @@ const manifest = JSON.parse(
   await readFile(new URL("../vendor/termyte-contract/package.json", import.meta.url), "utf8"),
 );
 
-if (manifest.name !== "termyte" || manifest.version !== "1.1.0") {
-  throw new Error("Vendored Termyte contract must be termyte@1.1.0");
+if (manifest.name !== "termyte" || manifest.version !== "2.0.0") {
+  throw new Error("Vendored Termyte contract must be termyte@2.0.0");
 }
 
 for (const subpath of ["./protocol", "./agent-sdk", "./security/redaction"]) {

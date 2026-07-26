@@ -12,6 +12,7 @@ import { redactValue } from "termyte/security/redaction";
 import type { Database } from "./db.js";
 import { transaction } from "./db.js";
 import { ForbiddenError, NotFoundError } from "./work.js";
+import type { SlackSynthesisRuntime } from "./synthesis.js";
 
 export const CONNECTOR_PROVIDERS = ["github", "slack", "linear"] as const;
 export type ConnectorProvider = typeof CONNECTOR_PROVIDERS[number];
@@ -21,6 +22,7 @@ export interface ConnectorRuntime {
   github?: { appSlug: string };
   slack?: { clientId: string; clientSecret: string };
   linear?: { clientId: string; clientSecret: string };
+  synthesis?: SlackSynthesisRuntime;
   webhookSecrets: Partial<Record<ConnectorProvider, string>>;
   fetch?: typeof fetch;
 }
