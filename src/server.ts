@@ -1113,7 +1113,15 @@ export function createApp(
       return context.json(protocolError("FORBIDDEN", "Credential lacks context:read", context.get("requestId")), 403);
     }
     try {
-      const input = parseProtocol(AcknowledgeReceiptRequestSchema, await context.req.json());
+      const body = await context.req.json() as Record<string, unknown>;
+      const normalizedBody = body.delivery_status
+        ? body
+        : body.failure_code !== undefined
+          ? { ...body, delivery_status: "failed" as const }
+          : body.delivered_at !== undefined
+            ? { ...body, delivery_status: "delivered" as const }
+            : body;
+      const input = parseProtocol(AcknowledgeReceiptRequestSchema, normalizedBody);
       return context.json(await acknowledgeReceipt(db, principal, context.req.param("id"), input));
     } catch (error) {
       if (error instanceof SyntaxError || isValidationError(error)) {

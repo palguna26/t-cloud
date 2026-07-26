@@ -448,17 +448,6 @@ export async function resolveContext(
       input.request_text,
       receiptType,
       taskMode,
-      {
-        handoff_id: selectedHandoffId,
-        authorization: {
-          agent_identity_id: principal.agentIdentityId,
-          credential_id: principal.credentialId,
-          device_authorization_id: principal.deviceAuthorizationId,
-          required_scope: "context:read",
-          work_thread_grant: "can_read_context",
-        },
-        omissions,
-      },
       JSON.stringify({
         handoff_id: selectedHandoffId,
         authorization: {
@@ -1009,6 +998,15 @@ async function candidateWork(
     WITH fts_candidates AS (
       SELECT w.id, w.title, w.objective, w.current_summary, w.repository_key,
         w.version, w.updated_at, NULL::uuid AS handoff_id, NULL::text AS instruction,
+        coalesce((
+          SELECT count(*)::integer
+          FROM context_items ci
+          WHERE ci.workspace_id = w.workspace_id
+            AND ci.work_thread_id = w.id
+            AND ci.state = 'active'
+            AND (ci.valid_until IS NULL OR ci.valid_until > now())
+            AND ci.confidence >= 0.5
+        ), 0) AS active_context_item_count,
         ts_rank(
           to_tsvector('english', coalesce(w.title, '') || ' ' || coalesce(w.objective, '') || ' ' || coalesce(w.current_summary, '')),
           plainto_tsquery('english', $4)
@@ -1035,6 +1033,15 @@ async function candidateWork(
       (
         SELECT w.id, w.title, w.objective, w.current_summary, w.repository_key,
           w.version, w.updated_at, NULL::uuid AS handoff_id, NULL::text AS instruction,
+          coalesce((
+            SELECT count(*)::integer
+            FROM context_items ci
+            WHERE ci.workspace_id = w.workspace_id
+              AND ci.work_thread_id = w.id
+              AND ci.state = 'active'
+              AND (ci.valid_until IS NULL OR ci.valid_until > now())
+              AND ci.confidence >= 0.5
+          ), 0) AS active_context_item_count,
           similarity(w.title, $4)::float8 AS lexical_score
         FROM work_threads w
         JOIN work_thread_agent_grants g
@@ -1054,6 +1061,15 @@ async function candidateWork(
       (
         SELECT w.id, w.title, w.objective, w.current_summary, w.repository_key,
           w.version, w.updated_at, NULL::uuid AS handoff_id, NULL::text AS instruction,
+          coalesce((
+            SELECT count(*)::integer
+            FROM context_items ci
+            WHERE ci.workspace_id = w.workspace_id
+              AND ci.work_thread_id = w.id
+              AND ci.state = 'active'
+              AND (ci.valid_until IS NULL OR ci.valid_until > now())
+              AND ci.confidence >= 0.5
+          ), 0) AS active_context_item_count,
           0.5::float8 AS lexical_score
         FROM work_threads w
         JOIN work_thread_agent_grants g
@@ -1070,6 +1086,15 @@ async function candidateWork(
       UNION ALL
       SELECT w.id, w.title, w.objective, w.current_summary, w.repository_key,
         w.version, w.updated_at, h.id AS handoff_id, h.instruction,
+        coalesce((
+          SELECT count(*)::integer
+          FROM context_items ci
+          WHERE ci.workspace_id = w.workspace_id
+            AND ci.work_thread_id = w.id
+            AND ci.state = 'active'
+            AND (ci.valid_until IS NULL OR ci.valid_until > now())
+            AND ci.confidence >= 0.5
+        ), 0) AS active_context_item_count,
         GREATEST(
           similarity(w.title, $4),
           similarity(h.instruction, $4),
@@ -1125,6 +1150,7 @@ function candidateScore(
   if (candidate.handoff_id) score += 2;
   if (recentlyParticipated) score += 1;
   score += taskModeScore(candidate, taskMode);
+  score += Math.min(3, candidate.active_context_item_count);
   score += candidate.lexical_score * 4;
   return score;
 }
@@ -1522,6 +1548,7 @@ interface CandidateRow extends WorkRow {
   handoff_id: string | null;
   instruction: string | null;
   lexical_score: number;
+  active_context_item_count: number;
 }
 
 interface ContextItemRow {

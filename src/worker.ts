@@ -116,12 +116,12 @@ async function projectEvent(
         LIMIT 1
       ) link ON true
       WHERE event.id = $1
-      FOR UPDATE OF event, entity
+      FOR UPDATE OF event
     `, [sourceEventId]);
     const event = result.rows[0];
     if (!event?.work_thread_id) return;
     const workThreadId = event.work_thread_id;
-    const payloadText = event.payload_text ?? String(event.payload_json["text"] ?? "");
+    const payloadText = projectedText(event.payload_text, event.payload_json);
     if (!payloadText) return;
     if (event.source_entity_id && event.current_source_event_id && event.current_source_event_id !== event.id) return;
     const workThread = (await client.query<{
@@ -387,6 +387,21 @@ function projectAgentEvent(event: {
     default:
       return [{ type: "observation", text, authority: 2, confidence: 1 }];
   }
+}
+
+function projectedText(
+  payloadText: string | null,
+  payloadJson: Record<string, unknown>,
+): string {
+  const value = payloadText
+    ?? payloadJson["text"]
+    ?? payloadJson["title"]
+    ?? payloadJson["body"]
+    ?? payloadJson["content"]
+    ?? payloadJson["message"]
+    ?? payloadJson["summary"]
+    ?? "";
+  return String(value).trim();
 }
 
 async function projectSlackSnapshot(
