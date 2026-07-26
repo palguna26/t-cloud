@@ -5,6 +5,7 @@ import { loadConfig } from "./config.js";
 import { createDatabase, transaction, type Database } from "./db.js";
 import { processStripeEvent } from "./billing.js";
 import type Stripe from "stripe";
+import { connectorKey, syncSlackThread, type ConnectorRuntime } from "./connectors.js";
 
 export interface Job {
   id: string;
@@ -44,7 +45,7 @@ async function complete(client: pg.PoolClient, job: Job): Promise<void> {
   await client.query(`
     UPDATE jobs
     SET state = 'succeeded', leased_by = NULL, lease_until = NULL, updated_at = now()
-    WHERE id = $1
+    WHERE id = $1 AND state = 'leased'
   `, [job.id]);
 }
 
@@ -55,7 +56,7 @@ async function fail(client: pg.PoolClient, job: Job, error: unknown): Promise<vo
     UPDATE jobs
     SET state = $2, leased_by = NULL, lease_until = NULL, last_error = $3,
         next_run_at = now() + ($4 * interval '1 second'), updated_at = now()
-    WHERE id = $1
+    WHERE id = $1 AND state = 'leased'
   `, [
     job.id,
     dead ? "dead" : "failed",
@@ -77,13 +78,21 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
       source: string;
       event_type: string;
       payload_text: string | null;
+      source_entity_id: string | null;
+      current_source_event_id: string | null;
     }>(`
-      SELECT id, workspace_id, work_thread_id, agent_identity_id,
-        agent_session_id, source, event_type, payload_text
-      FROM source_events WHERE id = $1
+      SELECT event.id, event.workspace_id,
+        coalesce(entity.work_thread_id, event.work_thread_id) AS work_thread_id,
+        event.agent_identity_id, event.agent_session_id, event.source,
+        event.event_type, event.payload_text, event.source_entity_id,
+        entity.current_source_event_id
+      FROM source_events event
+      LEFT JOIN source_entities entity ON entity.id = event.source_entity_id
+      WHERE event.id = $1
     `, [sourceEventId]);
     const event = result.rows[0];
     if (!event?.work_thread_id || !event.payload_text) return;
+    if (event.source_entity_id && event.current_source_event_id !== event.id) return;
     const type = PROJECTED_TYPES[event.event_type];
     if (!type) return;
 
@@ -94,13 +103,18 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
           type,
           text: finalResponse ? `Agent final response: ${event.payload_text}` : event.payload_text,
         }];
-    await client.query(`
-      DELETE FROM context_items
-      WHERE workspace_id = $2 AND id IN (
-        SELECT context_item_id FROM context_item_sources
-        WHERE source_event_id = $1 AND relationship LIKE 'derived%'
-      )
-    `, [sourceEventId, event.workspace_id]);
+    if (event.source_entity_id) {
+      await client.query(`
+        UPDATE context_items item SET state = 'superseded', updated_at = now()
+        WHERE item.workspace_id = $2 AND item.state = 'active' AND item.id IN (
+          SELECT source.context_item_id
+          FROM context_item_sources source
+          JOIN source_events prior ON prior.id = source.source_event_id
+          WHERE prior.source_entity_id = $1 AND prior.id <> $3
+            AND source.relationship LIKE 'derived%'
+        )
+      `, [event.source_entity_id, event.workspace_id, event.id]);
+    }
     for (const [index, projection] of projections.entries()) {
       const contextItemId = randomUUID();
       await client.query(`
@@ -140,20 +154,25 @@ async function projectEvent(db: Database, job: Job): Promise<void> {
 
 async function enforceRetention(db: Database, job: Job): Promise<void> {
   if (!job.workspace_id) throw new Error("enforce_retention requires workspace_id");
-  await db.query(`
-    UPDATE source_events se
-    SET payload_json = jsonb_build_object(
-          'schema_version', se.schema_version,
-          'event_id', se.external_id,
-          'event_type', se.event_type,
-          'retained_projection_only', true
-        ),
-        payload_text = NULL
-    FROM workspaces w
-    WHERE se.workspace_id = $1 AND w.id = se.workspace_id
-      AND se.occurred_at < now() - (w.retention_days * interval '1 day')
-      AND se.payload_text IS NOT NULL
-  `, [job.workspace_id]);
+  await transaction(db, async (client) => {
+    await client.query(`
+      UPDATE context_items item SET state = 'deleted', updated_at = now()
+      WHERE item.workspace_id = $1 AND item.id IN (
+        SELECT source.context_item_id
+        FROM context_item_sources source
+        JOIN source_events event ON event.id = source.source_event_id
+        JOIN workspaces workspace ON workspace.id = event.workspace_id
+        WHERE event.workspace_id = $1
+          AND event.occurred_at < now() - (workspace.retention_days * interval '1 day')
+      )
+    `, [job.workspace_id]);
+    await client.query(`
+      DELETE FROM source_events event
+      USING workspaces workspace
+      WHERE event.workspace_id = $1 AND workspace.id = event.workspace_id
+        AND event.occurred_at < now() - (workspace.retention_days * interval '1 day')
+    `, [job.workspace_id]);
+  });
 }
 
 async function deleteWorkspace(db: Database, job: Job): Promise<void> {
@@ -211,11 +230,19 @@ export function projectSlackIntent(text: string): Array<{ type: string; text: st
   return result;
 }
 
-export async function runOneJob(db: Database, workerId: string): Promise<boolean> {
+export async function runOneJob(
+  db: Database,
+  workerId: string,
+  connectorRuntime?: Pick<ConnectorRuntime, "encryptionKey" | "fetch">,
+): Promise<boolean> {
   const job = await claimJob(db, workerId);
   if (!job) return false;
   try {
     if (job.kind === "project_event") await projectEvent(db, job);
+    else if (job.kind === "sync_slack_thread") {
+      if (!connectorRuntime) throw new Error("Slack connector runtime is not configured");
+      await syncSlackThread(db, job.payload_json, connectorRuntime);
+    }
     else if (job.kind === "enforce_retention") await enforceRetention(db, job);
     else if (job.kind === "delete_workspace") await deleteWorkspace(db, job);
     else if (job.kind === "stripe_event") {
@@ -233,6 +260,9 @@ export async function runWorker(signal?: AbortSignal): Promise<void> {
   const config = loadConfig();
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
   const workerId = randomUUID();
+  const connectorRuntime = config.CONNECTOR_ENCRYPTION_KEY
+    ? { encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY) }
+    : undefined;
   let nextRetentionSweep = 0;
   try {
     while (!signal?.aborted) {
@@ -240,7 +270,7 @@ export async function runWorker(signal?: AbortSignal): Promise<void> {
         await enqueueRetentionJobs(db);
         nextRetentionSweep = Date.now() + 60 * 60_000;
       }
-      if (!await runOneJob(db, workerId)) {
+      if (!await runOneJob(db, workerId, connectorRuntime)) {
         await new Promise<void>((resolve) => {
           const finish = () => {
             clearTimeout(timeout);

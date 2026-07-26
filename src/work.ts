@@ -514,6 +514,7 @@ export async function reportOutcome(
     if (!outcomeId) {
       outcomeId = randomUUID();
       const sourceEventId = randomUUID();
+      const sourceEntityId = randomUUID();
       const verified = input.evidence.some((item) =>
         item.kind === "test"
         || item.kind === "build"
@@ -547,13 +548,25 @@ export async function reportOutcome(
         input.reported_at,
       ]);
       await client.query(`
+        INSERT INTO source_entities (
+          id, workspace_id, source, entity_key, current_source_event_id,
+          work_thread_id
+        ) VALUES ($1, $2, $3, $4, NULL, $5)
+      `, [
+        sourceEntityId,
+        principal.workspaceId,
+        principal.platform,
+        `outcome:${outcomeId}`,
+        work.id,
+      ]);
+      await client.query(`
         INSERT INTO source_events (
           id, workspace_id, work_thread_id, agent_identity_id, agent_session_id,
           source, external_id, event_type, occurred_at, schema_version,
-          payload_json, payload_text, redaction_state
+          payload_json, payload_text, redaction_state, source_entity_id
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, 'outcome',
-          to_timestamp($8 / 1000.0), $9, $10, $11, $12
+          to_timestamp($8 / 1000.0), $9, $10, $11, $12, $13
         )
       `, [
         sourceEventId,
@@ -568,7 +581,12 @@ export async function reportOutcome(
         input,
         currentSummary,
         sanitized.redaction.applied ? "server" : "edge",
+        sourceEntityId,
       ]);
+      await client.query(`
+        UPDATE source_entities SET current_source_event_id = $1, updated_at = now()
+        WHERE id = $2
+      `, [sourceEventId, sourceEntityId]);
       const projectedItems = [{
         id: randomUUID(),
         type: "outcome",

@@ -41,7 +41,8 @@ Already present and tested:
 - context resolution, abstention, clarification, and repository filtering;
 - Context Briefings and immutable Context Receipts;
 - authenticated agent event ingestion and durable projection jobs;
-- source-level deduplication;
+- immutable, timestamped Source Event versions with source-level deduplication;
+- full Slack-thread snapshots rather than individual Slack message events;
 - a dashboard for Work Threads, agents, receipts, sources, and corrections;
 - an explicit local demo login mode controlled by `DEMO_USER_ID`;
 - demo seed and signed Slack-event commands.
@@ -90,7 +91,9 @@ An immutable input from:
 - Slack, GitHub, or Linear;
 - Codex, Claude Code, or OpenCode.
 
-Source events are deduplicated by workspace, source, and external ID.
+Source Events are immutable versions. Each keeps provider occurrence and server
+receipt timestamps. A Source Entity points to the newest version used for
+current extraction, while older versions remain available for audit.
 
 ### Context Receipt
 
@@ -108,10 +111,10 @@ The audit record for one briefing:
 ### 1. Slack intake
 
 1. verify the raw request signature and timestamp;
-2. ignore bot, edit, and subtype noise;
+2. ignore bot and unrelated subtype noise while accepting thread edits;
 3. require an administrator-selected channel mapping;
 4. redact sensitive values;
-5. store the source event;
+5. fetch and store the complete Slack thread as one immutable Source Event;
 6. find or create the repository's Work Thread;
 7. enqueue projection.
 

@@ -17,7 +17,8 @@ Required secrets:
 - `SUPABASE_URL` and `SUPABASE_ANON_KEY`
 - `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_ID`
 - `METRICS_TOKEN` (generated for authenticated metrics scraping)
-- `CONNECTOR_ENCRYPTION_KEY` (exactly 32 random bytes, base64 encoded)
+- `CONNECTOR_ENCRYPTION_KEY` (exactly 32 random bytes, base64 encoded and shared
+  by the API and worker)
 - GitHub: `GITHUB_APP_SLUG` and `GITHUB_WEBHOOK_SECRET`
 - Slack: `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`
 - Linear: `LINEAR_CLIENT_ID`, `LINEAR_CLIENT_SECRET`, and

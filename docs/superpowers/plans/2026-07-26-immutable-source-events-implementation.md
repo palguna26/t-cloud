@@ -15,7 +15,7 @@ Changes:
   and current Work Thread routing.
 - Add `source_entity_id`, `supersedes_source_event_id`, and
   `provider_event_id` to `source_events`.
-- Backfill one entity and head for each existing connector Source Event.
+- Backfill connector identities and one entity per existing agent Source Event.
 - Replace the broad `(workspace_id, source, external_id)` unique constraint with:
   - the same partial uniqueness for agent events;
   - provider-delivery uniqueness for connector events.

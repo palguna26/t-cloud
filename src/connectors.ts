@@ -29,6 +29,8 @@ export interface NormalizedConnectorEvent {
   provider: ConnectorProvider;
   externalAccountId: string;
   externalId: string;
+  entityKey: string;
+  providerEventId?: string;
   eventType: "observation" | "decision" | "constraint" | "failure" | "evidence" | "outcome";
   title: string;
   text: string;
@@ -418,32 +420,66 @@ export async function ingestConnectorWebhook(
       raw: scopedEvent.raw,
     }, "connector_event");
     const contentHash = createHash("sha256")
-      .update(`${event.title}\0${event.text}`)
+      .update(JSON.stringify(redacted.value))
       .digest("hex");
+    const providerEventId = event.providerEventId ?? createHash("sha256")
+      .update(`${event.entityKey}\0${event.occurredAt.toISOString()}\0${contentHash}`)
+      .digest("hex");
+    const duplicate = (await client.query<{ id: string }>(`
+      SELECT id FROM source_events
+      WHERE workspace_id = $1 AND source = $2 AND provider_event_id = $3
+    `, [connection.workspace_id, event.provider, providerEventId])).rows[0];
+    if (duplicate) {
+      return { accepted: false, duplicate: true, source_event_id: duplicate.id };
+    }
+    const proposedEntityId = randomUUID();
+    await client.query(`
+      INSERT INTO source_entities (id, workspace_id, source, entity_key)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (workspace_id, source, entity_key) DO NOTHING
+    `, [proposedEntityId, connection.workspace_id, event.provider, event.entityKey]);
+    const entity = (await client.query<{
+      id: string;
+      current_source_event_id: string | null;
+      work_thread_id: string | null;
+    }>(`
+      SELECT id, current_source_event_id, work_thread_id
+      FROM source_entities
+      WHERE workspace_id = $1 AND source = $2 AND entity_key = $3
+      FOR UPDATE
+    `, [connection.workspace_id, event.provider, event.entityKey])).rows[0]!;
+    const current = entity.current_source_event_id
+      ? (await client.query<{ content_hash: string | null; occurred_at: Date }>(`
+          SELECT content_hash, occurred_at FROM source_events WHERE id = $1
+        `, [entity.current_source_event_id])).rows[0]
+      : undefined;
+    if (current?.content_hash === contentHash) {
+      return { accepted: false, duplicate: true, source_event_id: entity.current_source_event_id };
+    }
+    const previous = (await client.query<{ id: string }>(`
+      SELECT id FROM source_events
+      WHERE source_entity_id = $1 AND occurred_at <= $2
+      ORDER BY occurred_at DESC, received_at DESC LIMIT 1
+    `, [entity.id, event.occurredAt])).rows[0];
+    const becomesCurrent = !current || event.occurredAt.getTime() >= current.occurred_at.getTime();
     const sourceId = randomUUID();
-    const inserted = (await client.query<{ id: string }>(`
+    await client.query(`
       INSERT INTO source_events (
-        id, workspace_id, connector_connection_id, source, external_id,
+        id, workspace_id, work_thread_id, connector_connection_id, source, external_id,
         event_type, occurred_at, schema_version, payload_json, payload_text,
-        redaction_state, content_hash, canonical_url, provider_updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8, $9, $10, $11, $12, $13)
-      ON CONFLICT (workspace_id, source, external_id)
-      DO UPDATE SET
-        payload_json = excluded.payload_json,
-        payload_text = excluded.payload_text,
-        redaction_state = excluded.redaction_state,
-        content_hash = excluded.content_hash,
-        canonical_url = excluded.canonical_url,
-        provider_updated_at = excluded.provider_updated_at,
-        received_at = now()
-      WHERE source_events.content_hash IS DISTINCT FROM excluded.content_hash
-      RETURNING id
+        redaction_state, content_hash, canonical_url, provider_updated_at,
+        source_entity_id, supersedes_source_event_id, provider_event_id
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17
+      )
     `, [
       sourceId,
       connection.workspace_id,
+      entity.work_thread_id,
       connection.id,
       event.provider,
-      event.externalId,
+      event.entityKey,
       event.eventType,
       event.occurredAt,
       {
@@ -458,20 +494,166 @@ export async function ingestConnectorWebhook(
       contentHash,
       event.canonicalUrl ?? null,
       event.providerUpdatedAt ?? null,
-    ])).rows[0];
-    if (!inserted) return { accepted: false, duplicate: true };
-    const link = await linkConnectorEvent(client, connection, inserted.id, scopedEvent);
+      entity.id,
+      previous?.id ?? null,
+      providerEventId,
+    ]);
+    if (!becomesCurrent) {
+      return { accepted: true, duplicate: false, current: false, source_event_id: sourceId };
+    }
+    await client.query(`
+      UPDATE source_entities
+      SET current_source_event_id = $1, updated_at = now()
+      WHERE id = $2
+    `, [sourceId, entity.id]);
+    let link;
+    if (entity.work_thread_id) {
+      const linkId = randomUUID();
+      await client.query(`
+        INSERT INTO source_event_links (
+          id, workspace_id, source_event_id, work_thread_id, reason,
+          confidence, state, evidence_json
+        ) VALUES ($1, $2, $3, $4, 'new immutable version of linked source', 1, 'automatic', $5)
+      `, [linkId, connection.workspace_id, sourceId, entity.work_thread_id, {
+        repository_key: mappedRepository ?? null,
+        provider: event.provider,
+      }]);
+      await enqueueProjection(client, connection.workspace_id, sourceId);
+      link = { id: linkId, work_thread_id: entity.work_thread_id, state: "automatic", confidence: 1 };
+    } else {
+      link = await linkConnectorEvent(client, connection, entity.id, sourceId, scopedEvent);
+    }
     await client.query(`
       UPDATE connector_connections SET last_synced_at = now(), last_error = NULL, updated_at = now()
       WHERE id = $1
     `, [connection.id]);
-    return { accepted: true, duplicate: false, source_event_id: inserted.id, link };
+    return { accepted: true, duplicate: false, current: true, source_event_id: sourceId, link };
+  });
+}
+
+export async function enqueueSlackThreadSync(
+  db: Database,
+  event: NormalizedConnectorEvent,
+) {
+  if (event.provider !== "slack") throw new Error("Expected a Slack event");
+  const channelId = event.externalScopeId;
+  if (!channelId) throw new Error("Slack thread requires a channel");
+  return transaction(db, async (client) => {
+    const connection = (await client.query<{ id: string; workspace_id: string }>(`
+      SELECT connection.id, connection.workspace_id
+      FROM connector_connections connection
+      JOIN connector_scope_mappings mapping
+        ON mapping.connector_connection_id = connection.id
+      WHERE connection.provider = 'slack'
+        AND connection.external_account_id = $1
+        AND connection.status = 'active'
+        AND mapping.external_scope_id = $2
+    `, [event.externalAccountId, channelId])).rows[0];
+    if (!connection) return { accepted: false, duplicate: false, ignored: "scope_not_selected" };
+    const deliveryId = event.providerEventId ?? createHash("sha256")
+      .update(`${event.entityKey}\0${event.occurredAt.toISOString()}\0${event.text}`)
+      .digest("hex");
+    const result = await client.query(`
+      INSERT INTO jobs (id, workspace_id, kind, dedupe_key, payload_json, state)
+      VALUES ($1, $2, 'sync_slack_thread', $3, $4, 'pending')
+      ON CONFLICT (kind, dedupe_key) DO UPDATE SET
+        payload_json = excluded.payload_json,
+        state = 'pending', leased_by = NULL, lease_until = NULL,
+        next_run_at = now(), updated_at = now()
+      WHERE jobs.payload_json->>'provider_event_id'
+        IS DISTINCT FROM excluded.payload_json->>'provider_event_id'
+      RETURNING id
+    `, [randomUUID(), connection.workspace_id, event.entityKey, {
+      connection_id: connection.id,
+      team_id: event.externalAccountId,
+      channel_id: channelId,
+      thread_ts: event.entityKey.split(":").at(-1),
+      provider_event_id: deliveryId,
+      triggered_at: event.occurredAt.toISOString(),
+    }]);
+    return { accepted: result.rowCount === 1, duplicate: result.rowCount !== 1 };
+  });
+}
+
+export async function syncSlackThread(
+  db: Database,
+  payload: Record<string, unknown>,
+  runtime: Pick<ConnectorRuntime, "encryptionKey" | "fetch">,
+) {
+  const connectionId = String(payload["connection_id"] ?? "");
+  const channelId = String(payload["channel_id"] ?? "");
+  const threadTs = String(payload["thread_ts"] ?? "");
+  const connection = (await db.query<{
+    external_account_id: string;
+    credentials_ciphertext: Buffer | null;
+  }>(`
+    SELECT external_account_id, credentials_ciphertext
+    FROM connector_connections
+    WHERE id = $1 AND provider = 'slack' AND status = 'active'
+  `, [connectionId])).rows[0];
+  if (!connection?.credentials_ciphertext) throw new Error("Slack connector credentials are missing");
+  const credentials = decryptCredentials(runtime.encryptionKey, connection.credentials_ciphertext);
+  const token = credentials["access_token"];
+  if (typeof token !== "string") throw new Error("Slack access token is missing");
+  const request = runtime.fetch ?? fetch;
+  const messages: Array<Record<string, any>> = [];
+  let cursor = "";
+  do {
+    const url = new URL("https://slack.com/api/conversations.replies");
+    url.searchParams.set("channel", channelId);
+    url.searchParams.set("ts", threadTs);
+    url.searchParams.set("limit", "200");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const response = await request(url, { headers: { authorization: `Bearer ${token}` } });
+    const value = await response.json() as {
+      ok?: boolean;
+      error?: string;
+      messages?: Array<Record<string, any>>;
+      response_metadata?: { next_cursor?: string };
+    };
+    if (!response.ok || !value.ok) throw new Error(`Slack thread sync failed: ${value.error ?? response.status}`);
+    messages.push(...(value.messages ?? []));
+    cursor = value.response_metadata?.next_cursor ?? "";
+  } while (cursor);
+  const ordered = messages
+    .filter((message) => typeof message.ts === "string" && typeof message.text === "string")
+    .sort((left, right) => Number(left.ts) - Number(right.ts));
+  if (!ordered.length) throw new Error("Slack thread is empty");
+  const normalizedMessages = ordered.map((message) => ({
+    ts: String(message.ts),
+    thread_ts: String(message.thread_ts ?? message.ts),
+    user: message.user ? String(message.user) : null,
+    text: String(message.text),
+    occurred_at: new Date(Number(message.ts) * 1_000).toISOString(),
+    edited_at: message.edited?.ts
+      ? new Date(Number(message.edited.ts) * 1_000).toISOString()
+      : null,
+  }));
+  const latest = normalizedMessages.reduce((value, message) => {
+    const timestamp = new Date(message.edited_at ?? message.occurred_at);
+    return timestamp > value ? timestamp : value;
+  }, new Date(0));
+  const entityKey = `${connection.external_account_id}:${channelId}:${threadTs}`;
+  return ingestConnectorWebhook(db, {
+    provider: "slack",
+    externalAccountId: connection.external_account_id,
+    externalId: entityKey,
+    entityKey,
+    providerEventId: String(payload["provider_event_id"] ?? "") || undefined,
+    eventType: "observation",
+    title: normalizedMessages[0]!.text.slice(0, 120),
+    text: normalizedMessages.map((message) => message.text).join("\n"),
+    externalScopeId: channelId,
+    occurredAt: latest,
+    providerUpdatedAt: latest,
+    raw: { thread_ts: threadTs, messages: normalizedMessages },
   });
 }
 
 async function linkConnectorEvent(
   client: pg.PoolClient,
   connection: { id: string; workspace_id: string },
+  sourceEntityId: string,
   sourceEventId: string,
   event: NormalizedConnectorEvent,
 ) {
@@ -540,11 +722,12 @@ async function linkConnectorEvent(
     mapped && candidate?.repository_key && candidate.repository_key !== mapped,
   );
   if (crossRepository) state = "proposed";
-  await client.query(`
-    UPDATE source_events
-    SET work_thread_id = CASE WHEN $3 = 'automatic' THEN $1::uuid ELSE NULL END
-    WHERE id = $2
-  `, [workThreadId, sourceEventId, state]);
+  if (state === "automatic") {
+    await client.query(`
+      UPDATE source_entities SET work_thread_id = $1, updated_at = now()
+      WHERE id = $2
+    `, [workThreadId, sourceEntityId]);
+  }
   const linkId = randomUUID();
   await client.query(`
     INSERT INTO source_event_links (
@@ -610,10 +793,12 @@ export async function decideSourceLink(
     `, [accept ? "confirmed" : "rejected", userId, linkId, workspaceId])).rows[0];
     if (!link) throw new NotFoundError();
     if (accept) {
-      await client.query(`UPDATE source_events SET work_thread_id = $1 WHERE id = $2`, [
-        link.work_thread_id,
-        link.source_event_id,
-      ]);
+      await client.query(`
+        UPDATE source_entities entity
+        SET work_thread_id = $1, updated_at = now()
+        FROM source_events event
+        WHERE event.id = $2 AND entity.id = event.source_entity_id
+      `, [link.work_thread_id, link.source_event_id]);
       await enqueueProjection(client, workspaceId, link.source_event_id);
     }
     await audit(
@@ -655,36 +840,44 @@ export function normalizeConnectorWebhook(
     const action = typeof body.action === "string" ? body.action : "updated";
     const title = item.title ?? body.issue?.title ?? body.pull_request?.title
       ?? `GitHub ${headers.get("x-github-event") ?? "event"}`;
+    const entityKey = `${headers.get("x-github-event") ?? "event"}:${item.id}`;
     return {
       provider,
       externalAccountId: String(account),
-      externalId: `${headers.get("x-github-event") ?? "event"}:${item.id}`,
+      externalId: entityKey,
+      entityKey,
+      providerEventId: headers.get("x-github-delivery") ?? undefined,
       eventType: headers.get("x-github-event")?.includes("review") ? "evidence" : "observation",
       title: String(title),
       text: `${action}: ${String(item.body ?? item.state ?? title)}`,
       canonicalUrl: item.html_url,
       externalScopeId: String(repository.id),
       repositoryKey: `github.com/${repository.full_name}`,
-      occurredAt: date(item.created_at ?? body.repository?.updated_at),
+      occurredAt: date(item.updated_at ?? item.submitted_at ?? item.created_at ?? body.repository?.updated_at),
       providerUpdatedAt: date(item.updated_at ?? item.submitted_at),
       raw: body,
     };
   }
   if (provider === "slack") {
     if (body.type !== "event_callback" || body.event?.type !== "message") return null;
-    const event = body.event;
-    if (event.bot_id || event.subtype) return null;
-    if (!body.team_id || !event.channel || !event.ts || !event.text) return null;
+    const envelope = body.event;
+    if (envelope.bot_id || (envelope.subtype && envelope.subtype !== "message_changed")) return null;
+    const event = envelope.subtype === "message_changed" ? envelope.message : envelope;
+    if (!body.team_id || !envelope.channel || !event?.ts || !event.text) return null;
+    const rootTs = String(event.thread_ts ?? event.ts);
+    const entityKey = `${body.team_id}:${envelope.channel}:${rootTs}`;
     const title = String(event.text).split(/\r?\n/, 1)[0]!.trim().slice(0, 120);
     return {
       provider,
       externalAccountId: String(body.team_id),
-      externalId: `${event.channel}:${event.ts}`,
+      externalId: entityKey,
+      entityKey,
+      providerEventId: typeof body.event_id === "string" ? body.event_id : undefined,
       eventType: "observation",
       title,
       text: String(event.text),
-      externalScopeId: String(event.channel),
-      occurredAt: new Date(Number(event.ts) * 1_000),
+      externalScopeId: String(envelope.channel),
+      occurredAt: new Date(Number(event.edited?.ts ?? envelope.event_ts ?? event.ts) * 1_000),
       providerUpdatedAt: event.edited?.ts ? new Date(Number(event.edited.ts) * 1_000) : undefined,
       raw: body,
     };
@@ -693,17 +886,20 @@ export function normalizeConnectorWebhook(
   const organizationId = body.organizationId ?? body.organization?.id;
   if (!organizationId || !data?.id) return null;
   const type = String(body.type ?? "Linear");
+  const entityKey = `${type}:${data.id}`;
   const title = String(data.title ?? data.body?.slice?.(0, 120) ?? `${type} update`);
   return {
     provider,
     externalAccountId: String(organizationId),
-    externalId: `${type}:${data.id}`,
+    externalId: entityKey,
+    entityKey,
+    providerEventId: String(body.webhookId ?? body.webhook_id ?? "") || undefined,
     eventType: type === "Comment" ? "observation" : "decision",
     title,
     text: String(data.description ?? data.body ?? `${body.action ?? "updated"} ${title}`),
     canonicalUrl: data.url,
     externalScopeId: String(data.teamId ?? data.projectId ?? data.team?.id ?? ""),
-    occurredAt: date(data.createdAt ?? body.webhookTimestamp),
+    occurredAt: date(data.updatedAt ?? body.webhookTimestamp ?? data.createdAt),
     providerUpdatedAt: date(data.updatedAt ?? body.webhookTimestamp),
     raw: body,
   };

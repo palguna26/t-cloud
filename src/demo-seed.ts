@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import { createAgentCredential, createAgentIdentity, createWorkspace } from "./admin.js";
 import { loadConfig } from "./config.js";
 import { createDatabase } from "./db.js";
+import { connectorKey, encryptCredentials } from "./connectors.js";
 
 const USER_ID = process.env.DEMO_USER_ID ?? "00000000-0000-4000-8000-000000000001";
 const SLACK_TEAM = process.env.DEMO_SLACK_TEAM ?? "T-DEMO";
 const SLACK_CHANNEL = process.env.DEMO_SLACK_CHANNEL ?? "C-DEMO";
 const REPOSITORY = process.env.DEMO_REPOSITORY ?? "github.com/termyte/demo-auth";
+const SLACK_BOT_TOKEN = process.env.DEMO_SLACK_BOT_TOKEN;
+if (!SLACK_BOT_TOKEN) throw new Error("DEMO_SLACK_BOT_TOKEN is required");
 const SCOPES = [
   "events:write",
   "context:read",
@@ -16,6 +19,7 @@ const SCOPES = [
 ] as const;
 
 const config = loadConfig({ ...process.env, DEMO_USER_ID: USER_ID });
+if (!config.CONNECTOR_ENCRYPTION_KEY) throw new Error("CONNECTOR_ENCRYPTION_KEY is required");
 const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
 
 try {
@@ -44,9 +48,18 @@ try {
   await db.query(`
     INSERT INTO connector_connections (
       id, workspace_id, provider, name, external_account_id,
-      selected_scopes, created_by_user_id
-    ) VALUES ($1, $2, 'slack', 'Demo Slack', $3, $4, $5)
-  `, [connectorId, workspace.id, SLACK_TEAM, JSON.stringify([SLACK_CHANNEL]), USER_ID]);
+      credentials_ciphertext, selected_scopes, created_by_user_id
+    ) VALUES ($1, $2, 'slack', 'Demo Slack', $3, $4, $5, $6)
+  `, [
+    connectorId,
+    workspace.id,
+    SLACK_TEAM,
+    encryptCredentials(connectorKey(config.CONNECTOR_ENCRYPTION_KEY), {
+      access_token: SLACK_BOT_TOKEN,
+    }),
+    JSON.stringify([SLACK_CHANNEL]),
+    USER_ID,
+  ]);
   await db.query(`
     INSERT INTO connector_scope_mappings (
       id, workspace_id, connector_connection_id, external_scope_id,

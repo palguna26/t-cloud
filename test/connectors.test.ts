@@ -82,10 +82,15 @@ describe("connector normalization", () => {
         html_url: "https://github.com/termyte/app/issues/1",
         created_at: "2026-07-24T00:00:00Z",
       },
-    }, new Headers({ "x-github-event": "issues" }));
+    }, new Headers({
+      "x-github-event": "issues",
+      "x-github-delivery": "delivery-1",
+    }));
     expect(event).toMatchObject({
       externalAccountId: "42",
       externalId: "issues:9",
+      entityKey: "issues:9",
+      providerEventId: "delivery-1",
       repositoryKey: "github.com/termyte/app",
       externalScopeId: "7",
       title: "Authentication fails after refresh",
@@ -105,14 +110,15 @@ describe("connector normalization", () => {
     }, new Headers());
     expect(event).toMatchObject({
       externalAccountId: "T1",
-      externalId: "C1:1800000000.000001",
+      externalId: "T1:C1:1800000000.000001",
       externalScopeId: "C1",
+      entityKey: "T1:C1:1800000000.000001",
       eventType: "observation",
       title: "Customer cannot sign in after refreshing.",
     });
   });
 
-  it("ignores Slack bot and subtype messages", () => {
+  it("ignores Slack bots and groups edits with their root thread", () => {
     const base = {
       type: "event_callback",
       team_id: "T1",
@@ -127,10 +133,27 @@ describe("connector normalization", () => {
       ...base,
       event: { ...base.event, bot_id: "B1" },
     }, new Headers())).toBeNull();
-    expect(normalizeConnectorWebhook("slack", {
+    const edited = normalizeConnectorWebhook("slack", {
       ...base,
-      event: { ...base.event, subtype: "message_changed" },
-    }, new Headers())).toBeNull();
+      event_id: "Ev-edit",
+      event: {
+        type: "message",
+        subtype: "message_changed",
+        channel: "C1",
+        event_ts: "1800000002.000001",
+        message: {
+          ts: "1800000001.000001",
+          thread_ts: "1800000000.000001",
+          text: "Edited reply",
+          edited: { ts: "1800000002.000001" },
+        },
+      },
+    }, new Headers());
+    expect(edited).toMatchObject({
+      entityKey: "T1:C1:1800000000.000001",
+      providerEventId: "Ev-edit",
+      text: "Edited reply",
+    });
   });
 
   it("normalizes Linear issues with team scope", () => {
@@ -151,6 +174,7 @@ describe("connector normalization", () => {
       externalAccountId: "org-1",
       externalId: "Issue:issue-1",
       externalScopeId: "team-1",
+      entityKey: "Issue:issue-1",
       eventType: "decision",
     });
   });

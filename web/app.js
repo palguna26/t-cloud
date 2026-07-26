@@ -367,7 +367,7 @@ function detailTab() {
       ${detail.sources?.length ? `<div class="section-heading"><div><h3>Organizational sources</h3><p>Where this work context came from.</p></div></div>
         <div class="stack">${detail.sources.map((source) => `
           <article class="context-item">
-            <div class="item-top"><span class="context-type">${escapeHtml(source.source)}</span><span class="muted">${relativeTime(source.occurred_at)}</span></div>
+            <div class="item-top"><span class="context-type">${escapeHtml(source.source)}${source.is_current === false ? " · superseded" : ""}</span><span class="muted">occurred ${relativeTime(source.occurred_at)} · received ${relativeTime(source.received_at)}</span></div>
             <p>${escapeHtml(source.payload_text || source.event_type)}</p>
             ${source.canonical_url ? `<a href="${escapeHtml(source.canonical_url)}" target="_blank" rel="noreferrer">Open source record</a>` : ""}
           </article>`).join("")}</div>` : ""}`;

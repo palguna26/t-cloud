@@ -9,7 +9,8 @@ source entity rather than processing its messages as separate Source Events.
 ## Scope
 
 This design covers connector events from Slack, GitHub, and Linear. Agent events
-already use insert-only deduplication and will keep that behavior.
+remain insert-only and use one Source Entity per event so later Work Thread
+routing changes never mutate their Source Event rows.
 
 ## Data model
 
@@ -128,9 +129,9 @@ keep their stored source snapshots and remain unchanged.
 
 ## Migration
 
-Create one Source Entity for each existing connector source identity and attach
-its existing Source Event as the current head. Existing agent Source Events do
-not need shared entities and remain insert-only.
+Create one Source Entity for each existing connector source identity and each
+existing agent Source Event. Agent entities contain one immutable version;
+connector entities may contain many versions.
 
 Remove connector code that updates Source Event payloads or Work Thread IDs.
 Move connector routing reads and writes to Source Entities. Replace retention's

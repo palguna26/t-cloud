@@ -231,7 +231,11 @@ export async function listWorkThreads(
       count(DISTINCT cr.id)::integer AS receipt_count
     FROM work_threads w
     LEFT JOIN source_events se
-      ON se.workspace_id = w.workspace_id AND se.work_thread_id = w.id
+      ON se.workspace_id = w.workspace_id AND coalesce(
+        (SELECT entity.work_thread_id FROM source_entities entity
+          WHERE entity.id = se.source_entity_id),
+        se.work_thread_id
+      ) = w.id
     LEFT JOIN context_receipts cr
       ON cr.workspace_id = w.workspace_id AND cr.work_thread_id = w.id
     WHERE w.workspace_id = $1 AND w.deleted_at IS NULL
@@ -355,12 +359,15 @@ export async function getWorkThread(
     `, [workspaceId, workThreadId]),
     db.query(`
       SELECT se.id, se.source, se.external_id, se.event_type, se.payload_text,
-        se.canonical_url, se.occurred_at, se.provider_updated_at,
+        se.canonical_url, se.occurred_at, se.received_at, se.provider_updated_at,
+        (entity.current_source_event_id = se.id) AS is_current,
         c.name AS connector_name
       FROM source_events se
+      LEFT JOIN source_entities entity ON entity.id = se.source_entity_id
       LEFT JOIN connector_connections c
         ON c.id = se.connector_connection_id AND c.workspace_id = se.workspace_id
-      WHERE se.workspace_id = $1 AND se.work_thread_id = $2
+      WHERE se.workspace_id = $1
+        AND coalesce(entity.work_thread_id, se.work_thread_id) = $2
       ORDER BY se.occurred_at DESC
     `, [workspaceId, workThreadId]),
   ]);
@@ -1080,7 +1087,7 @@ export async function mergeWorkThreads(
     `, [workspaceId, [sourceWorkThreadId, targetWorkThreadId]]);
     if (locked.rows.length !== 2) throw new NotFoundError();
     await client.query(`
-      UPDATE source_events SET work_thread_id = $1
+      UPDATE source_entities SET work_thread_id = $1, updated_at = now()
       WHERE workspace_id = $2 AND work_thread_id = $3
     `, [targetWorkThreadId, workspaceId, sourceWorkThreadId]);
     await client.query(`
@@ -1154,10 +1161,12 @@ export async function splitWorkThread(
     `, [sourceWorkThreadId, workspaceId]);
     if (!source.rows[0]) throw new NotFoundError();
     const events = await client.query<{ id: string }>(`
-      SELECT id FROM source_events
-      WHERE workspace_id = $1 AND work_thread_id = $2
-        AND id = ANY($3::uuid[])
-      FOR UPDATE
+      SELECT event.id FROM source_events event
+      LEFT JOIN source_entities entity ON entity.id = event.source_entity_id
+      WHERE event.workspace_id = $1
+        AND coalesce(entity.work_thread_id, event.work_thread_id) = $2
+        AND event.id = ANY($3::uuid[])
+      FOR UPDATE OF event
     `, [workspaceId, sourceWorkThreadId, input.sourceEventIds]);
     if (events.rows.length !== input.sourceEventIds.length) throw new NotFoundError();
     const newId = randomUUID();
@@ -1175,8 +1184,10 @@ export async function splitWorkThread(
       throw error;
     }
     await client.query(`
-      UPDATE source_events SET work_thread_id = $1
-      WHERE workspace_id = $2 AND id = ANY($3::uuid[])
+      UPDATE source_entities entity SET work_thread_id = $1, updated_at = now()
+      FROM source_events event
+      WHERE event.workspace_id = $2 AND event.id = ANY($3::uuid[])
+        AND entity.id = event.source_entity_id
     `, [newId, workspaceId, input.sourceEventIds]);
     await client.query(`
       UPDATE context_items ci SET work_thread_id = $1, updated_at = now()
@@ -1348,8 +1359,8 @@ export async function deleteSourceEvent(
 ) {
   return transaction(db, async (client) => {
     await requireMembership(client, userId, workspaceId);
-    const event = await client.query(`
-      SELECT id FROM source_events WHERE id = $1 AND workspace_id = $2
+    const event = await client.query<{ id: string; source_entity_id: string | null }>(`
+      SELECT id, source_entity_id FROM source_events WHERE id = $1 AND workspace_id = $2
       FOR UPDATE
     `, [sourceEventId, workspaceId]);
     if (!event.rows[0]) throw new NotFoundError();
@@ -1361,6 +1372,24 @@ export async function deleteSourceEvent(
     `, [workspaceId, sourceEventId]);
     await audit(client, workspaceId, userId, "source_event.delete", "source_event", sourceEventId);
     await client.query(`DELETE FROM source_events WHERE id = $1`, [sourceEventId]);
+    if (event.rows[0].source_entity_id) {
+      const previous = (await client.query<{ id: string }>(`
+        SELECT id FROM source_events WHERE source_entity_id = $1
+        ORDER BY occurred_at DESC, received_at DESC LIMIT 1
+      `, [event.rows[0].source_entity_id])).rows[0];
+      await client.query(`
+        UPDATE source_entities SET current_source_event_id = $1, updated_at = now()
+        WHERE id = $2
+      `, [previous?.id ?? null, event.rows[0].source_entity_id]);
+      if (previous) {
+        await client.query(`
+          INSERT INTO jobs (id, workspace_id, kind, dedupe_key, payload_json, state)
+          VALUES ($1, $2, 'project_event', $3, $4, 'pending')
+          ON CONFLICT (kind, dedupe_key) DO UPDATE
+            SET state = 'pending', next_run_at = now(), updated_at = now()
+        `, [randomUUID(), workspaceId, previous.id, { source_event_id: previous.id }]);
+      }
+    }
     return { deleted: true };
   });
 }

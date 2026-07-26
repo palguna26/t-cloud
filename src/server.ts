@@ -95,6 +95,7 @@ import {
   CONNECTOR_PROVIDERS,
   connectorKey,
   decideSourceLink,
+  enqueueSlackThreadSync,
   finishConnectorOAuth,
   ingestConnectorWebhook,
   listConnectorAttention,
@@ -250,7 +251,10 @@ export function createApp(
     const event = normalizeConnectorWebhook(provider, body, context.req.raw.headers);
     if (!event) return context.json({ received: true, ignored: true });
     try {
-      return context.json({ received: true, ...await ingestConnectorWebhook(db, event) });
+      const result = provider === "slack"
+        ? await enqueueSlackThreadSync(db, event)
+        : await ingestConnectorWebhook(db, event);
+      return context.json({ received: true, ...result });
     } catch (error) {
       if (error instanceof NotFoundError) {
         return context.json({ received: false }, 404);
@@ -965,16 +969,34 @@ export function createApp(
           event.source.platform,
           event.occurred_at,
         ]);
+        const proposedEntityId = randomUUID();
+        await client.query(`
+          INSERT INTO source_entities (
+            id, workspace_id, source, entity_key, work_thread_id
+          ) VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (workspace_id, source, entity_key) DO NOTHING
+        `, [
+          proposedEntityId,
+          principal.workspaceId,
+          event.source.platform,
+          event.event_id,
+          event.work_thread_id ?? null,
+        ]);
+        const sourceEntityId = (await client.query<{ id: string }>(`
+          SELECT id FROM source_entities
+          WHERE workspace_id = $1 AND source = $2 AND entity_key = $3
+        `, [principal.workspaceId, event.source.platform, event.event_id])).rows[0]!.id;
         const inserted = await client.query<{ id: string }>(`
           INSERT INTO source_events (
             id, workspace_id, work_thread_id, agent_identity_id, agent_session_id,
             source, external_id, event_type, occurred_at, received_at,
-            schema_version, payload_json, payload_text, redaction_state
+            schema_version, payload_json, payload_text, redaction_state,
+            source_entity_id
           ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
-            to_timestamp($9 / 1000.0), now(), $10, $11, $12, $13
+            to_timestamp($9 / 1000.0), now(), $10, $11, $12, $13, $14
           )
-          ON CONFLICT (workspace_id, source, external_id) DO NOTHING
+          ON CONFLICT DO NOTHING
           RETURNING id
         `, [
           randomUUID(),
@@ -990,7 +1012,15 @@ export function createApp(
           event,
           event.content ?? null,
           redactedEventIds.has(event.event_id) ? "server" : "edge",
+          sourceEntityId,
         ]);
+        if (inserted.rows[0]) {
+          await client.query(`
+            UPDATE source_entities
+            SET current_source_event_id = $1, updated_at = now()
+            WHERE id = $2
+          `, [inserted.rows[0].id, sourceEntityId]);
+        }
         if (inserted.rows[0] && event.work_thread_id) {
           await client.query(`
             INSERT INTO jobs (

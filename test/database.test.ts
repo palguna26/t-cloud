@@ -7,6 +7,7 @@ import { issueAgentCredential } from "../src/agent-auth.js";
 import { createDatabase, type Database } from "../src/db.js";
 import { createApp } from "../src/server.js";
 import { runOneJob } from "../src/worker.js";
+import { encryptCredentials } from "../src/connectors.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const suite = databaseUrl ? describe : describe.skip;
@@ -180,13 +181,15 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     const installationId = String(Date.now());
     const channelId = `C-${randomUUID()}`;
     const linearTeamId = `TEAM-${randomUUID()}`;
+    const connectorEncryptionKey = randomBytes(32);
     await db.query(`
       INSERT INTO connector_connections (
-        id, workspace_id, provider, name, external_account_id, created_by_user_id
+        id, workspace_id, provider, name, external_account_id,
+        credentials_ciphertext, created_by_user_id
       ) VALUES
-        ($1, $4, 'slack', 'Customer Slack', $5, $7),
-        ($2, $4, 'linear', 'Product Linear', $6, $7),
-        ($3, $4, 'github', 'Engineering GitHub', $8, $7)
+        ($1, $4, 'slack', 'Customer Slack', $5, $9, $7),
+        ($2, $4, 'linear', 'Product Linear', $6, NULL, $7),
+        ($3, $4, 'github', 'Engineering GitHub', $8, NULL, $7)
     `, [
       slackId,
       linearId,
@@ -196,6 +199,7 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
       organizationId,
       ownerUserId,
       installationId,
+      encryptCredentials(connectorEncryptionKey, { access_token: "xoxb-test" }),
     ]);
     await db.query(`
       INSERT INTO connector_scope_mappings (
@@ -211,13 +215,25 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
       slack: "slack-connector-test-secret",
       linear: "linear-connector-test-secret",
     };
+    const now = Date.now();
+    let slackMessages: Array<Record<string, any>> = [{
+      type: "message",
+      channel: channelId,
+      ts: String(now / 1_000),
+      text: "Customer reports an authentication refresh bug. Keep existing sessions active.",
+    }];
+    const slackFetch = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      messages: slackMessages,
+      response_metadata: { next_cursor: "" },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
     const app = createApp(db, pepper, {
       connectorRuntime: {
-        encryptionKey: randomBytes(32),
+        encryptionKey: connectorEncryptionKey,
         webhookSecrets: secrets,
+        fetch: slackFetch as typeof fetch,
       },
     });
-    const now = Date.now();
     const slackBody = JSON.stringify({
       type: "event_callback",
       team_id: teamId,
@@ -240,6 +256,20 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     });
     expect(slack.status).toBe(200);
     expect(await slack.json()).toMatchObject({ received: true, accepted: true });
+    const slackReplay = await app.request("/webhooks/connectors/slack", {
+      method: "POST",
+      headers: {
+        "x-slack-request-timestamp": slackTimestamp,
+        "x-slack-signature": `v0=${createHmac("sha256", secrets.slack)
+          .update(`v0:${slackTimestamp}:${slackBody}`).digest("hex")}`,
+      },
+      body: slackBody,
+    });
+    expect(await slackReplay.json()).toMatchObject({ duplicate: true });
+    expect((await db.query(`
+      SELECT count(*)::integer AS count FROM jobs
+      WHERE kind = 'sync_slack_thread' AND workspace_id = $1
+    `, [workspaceId])).rows[0].count).toBe(1);
 
     const linearBody = JSON.stringify({
       organizationId,
@@ -289,7 +319,10 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     });
     expect(github.status).toBe(200);
 
-    while (await runOneJob(db, "connector-test-worker")) {
+    while (await runOneJob(db, "connector-test-worker", {
+      encryptionKey: connectorEncryptionKey,
+      fetch: slackFetch as typeof fetch,
+    })) {
       const pending = Number((await db.query(`
         SELECT count(*)::integer AS n FROM jobs
         WHERE workspace_id = $1 AND state IN ('pending', 'failed', 'leased')
@@ -311,7 +344,7 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
       },
       body: JSON.stringify({
         schema_version: TERMYTE_PROTOCOL_VERSION,
-        request_text: "Fix that auth bug",
+        request_text: "Fix authentication refresh bug",
         agent_session_id: "fresh-organizational-context-session",
         repository_key: "termyte/app",
         idempotency_key: `connector-context-${randomUUID()}`,
@@ -325,6 +358,68 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     });
     expect(resolved.briefing).toContain("authentication");
     expect(resolved.sources.length).toBeGreaterThanOrEqual(1);
+
+    slackMessages = [{
+      ...slackMessages[0]!,
+      text: "Customer reports an authentication refresh bug.\nReturn a rotated cookie without ending active sessions.",
+      edited: { ts: String((now + 1_000) / 1_000) },
+    }];
+    const editBody = JSON.stringify({
+      type: "event_callback",
+      event_id: `Ev-${randomUUID()}`,
+      team_id: teamId,
+      event: {
+        type: "message",
+        subtype: "message_changed",
+        channel: channelId,
+        event_ts: String((now + 1_000) / 1_000),
+        message: slackMessages[0],
+      },
+    });
+    const editTimestamp = String(Math.floor(now / 1_000));
+    expect((await app.request("/webhooks/connectors/slack", {
+      method: "POST",
+      headers: {
+        "x-slack-request-timestamp": editTimestamp,
+        "x-slack-signature": `v0=${createHmac("sha256", secrets.slack)
+          .update(`v0:${editTimestamp}:${editBody}`).digest("hex")}`,
+      },
+      body: editBody,
+    })).status).toBe(200);
+    while (await runOneJob(db, "connector-edit-worker", {
+      encryptionKey: connectorEncryptionKey,
+      fetch: slackFetch as typeof fetch,
+    })) {
+      // Drain the thread sync and projection jobs.
+    }
+    const versions = await db.query(`
+      SELECT event.id, entity.current_source_event_id,
+        event.occurred_at, event.received_at
+      FROM source_events event
+      JOIN source_entities entity ON entity.id = event.source_entity_id
+      WHERE event.workspace_id = $1 AND event.source = 'slack'
+        AND entity.entity_key = $2
+      ORDER BY event.occurred_at
+    `, [workspaceId, `${teamId}:${channelId}:${now / 1_000}`]);
+    expect(versions.rows).toHaveLength(2);
+    expect(versions.rows[1].id).toBe(versions.rows[1].current_source_event_id);
+    const projectedStates = await db.query(`
+      SELECT item.state, count(*)::integer AS count
+      FROM context_items item
+      JOIN context_item_sources source ON source.context_item_id = item.id
+      JOIN source_events event ON event.id = source.source_event_id
+      WHERE event.source_entity_id = (
+        SELECT source_entity_id FROM source_events WHERE id = $1
+      )
+      GROUP BY item.state
+    `, [versions.rows[1].id]);
+    expect(projectedStates.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: "active" }),
+      expect.objectContaining({ state: "superseded" }),
+    ]));
+    await expect(db.query(`
+      UPDATE source_events SET payload_text = 'mutated' WHERE id = $1
+    `, [versions.rows[0].id])).rejects.toThrow(/immutable/i);
   });
 
   it("rate limits repeated unauthenticated device starts", async () => {
@@ -1242,7 +1337,10 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     expect(splitResponse.status).toBe(201);
     const split = await splitResponse.json() as any;
     expect((await db.query(`
-      SELECT work_thread_id FROM source_events WHERE id = $1
+      SELECT entity.work_thread_id
+      FROM source_events event
+      JOIN source_entities entity ON entity.id = event.source_entity_id
+      WHERE event.id = $1
     `, [privateRecord.source_event_id])).rows[0].work_thread_id).toBe(split.work_thread_id);
     expect((await db.query(`
       SELECT work_thread_id FROM context_items WHERE id = $1
@@ -1405,7 +1503,7 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
         event_type: "evidence",
         agent_session_id: "data-session",
         work_thread_id: created.work_thread.id,
-        occurred_at: Date.now(),
+        occurred_at: Date.now() - 30 * 24 * 60 * 60_000,
         source: { platform: "codex" },
         content: "Old raw evidence detail.",
       }],
@@ -1447,10 +1545,6 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
     if (afterDelete.state !== "resolved") throw new Error("Expected resolved context");
     expect(afterDelete.briefing).not.toContain("This source will be deleted.");
 
-    await db.query(`
-      UPDATE source_events SET occurred_at = now() - interval '30 days'
-      WHERE workspace_id = $1 AND external_id = 'retained-source'
-    `, [workspaceId]);
     const retention = await admin(`/v1/admin/workspaces/${workspaceId}/retention`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1464,8 +1558,7 @@ suite("PostgreSQL tenant and Agent Identity boundaries", () => {
       SELECT payload_text, payload_json FROM source_events
       WHERE workspace_id = $1 AND external_id = 'retained-source'
     `, [workspaceId]);
-    expect(retained.rows[0].payload_text).toBeNull();
-    expect(retained.rows[0].payload_json).toMatchObject({ retained_projection_only: true });
+    expect(retained.rows).toHaveLength(0);
 
     const secondary = await admin("/v1/admin/workspaces", {
       method: "POST",
