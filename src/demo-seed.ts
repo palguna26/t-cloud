@@ -14,8 +14,6 @@ const SCOPES = [
   "events:write",
   "context:read",
   "outcomes:write",
-  "handoffs:create",
-  "handoffs:claim",
 ] as const;
 
 const config = loadConfig({ ...process.env, DEMO_USER_ID: USER_ID });

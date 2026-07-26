@@ -4,8 +4,16 @@ const manifest = JSON.parse(
   await readFile(new URL("../vendor/termyte-contract/package.json", import.meta.url), "utf8"),
 );
 
-if (manifest.name !== "termyte" || manifest.version !== "2.0.0") {
-  throw new Error("Vendored Termyte contract must be termyte@2.0.0");
+if (manifest.name !== "termyte" || manifest.version !== "3.0.0") {
+  throw new Error("Vendored Termyte contract must be termyte@3.0.0");
+}
+
+const fixtureManifest = JSON.parse(await readFile(new URL("../test/fixtures/cloud-contract/v3/manifest.json", import.meta.url), "utf8"));
+if (fixtureManifest.schema_version !== 3) throw new Error("Vendored cloud fixtures must be protocol v3");
+for (const [name, expected] of Object.entries(fixtureManifest.files)) {
+  const bytes = await readFile(new URL(`../test/fixtures/cloud-contract/v3/${name}`, import.meta.url));
+  const actual = (await import("node:crypto")).createHash("sha256").update(bytes).digest("hex");
+  if (actual !== expected) throw new Error(`Fixture hash mismatch: ${name}`);
 }
 
 for (const subpath of ["./protocol", "./agent-sdk", "./security/redaction"]) {

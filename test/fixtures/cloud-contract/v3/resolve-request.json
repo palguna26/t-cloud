@@ -1,0 +1,1 @@
+{"schema_version":3,"request_text":"fix auth","agent_session_id":"session-1","repository_key":"github.com/acme/app","changed_files":["src/auth.ts"],"recent_files":[],"explicit_references":[],"cloud_token_budget":1200,"idempotency_key":"context:session-1:1"}

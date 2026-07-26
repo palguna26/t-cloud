@@ -11,7 +11,7 @@ import {
   type ReportOutcomeRequest,
   type ResolveContextRequest,
   type ResolveContextResponse,
-} from "termyte/protocol";
+} from "./legacy-protocol.js";
 import { redactValue } from "termyte/security/redaction";
 import type { AgentPrincipal } from "./agent-auth.js";
 import { transaction, type Database } from "./db.js";
@@ -516,13 +516,23 @@ export async function acknowledgeReceipt(
     const row = receipt.rows[0];
     if (!row) throw new NotFoundError();
     if (input.delivery_status === "delivered") {
+      const hash = createHash("sha256").update(input.final_packet).digest("hex");
+      if (hash !== input.final_packet_sha256) throw new ConflictError("final_packet_sha256 does not match final_packet");
       await client.query(`
         UPDATE context_receipts
         SET delivered_at = COALESCE(delivered_at, to_timestamp($4 / 1000.0)),
             delivery_status = 'delivered',
-            acknowledged_at = COALESCE(acknowledged_at, now())
+            acknowledged_at = COALESCE(acknowledged_at, now()),
+            final_packet = COALESCE(final_packet, $5),
+            final_packet_sha256 = COALESCE(final_packet_sha256, $6),
+            local_item_count = COALESCE(local_item_count, $7),
+            cloud_item_ids = COALESCE(cloud_item_ids, $8::jsonb),
+            delivery_state = 'delivered'
         WHERE id = $1 AND workspace_id = $2 AND agent_identity_id = $3
-      `, [receiptId, principal.workspaceId, principal.agentIdentityId, input.delivered_at]);
+          AND (final_packet IS NULL OR (final_packet = $5 AND final_packet_sha256 = $6))
+      `, [receiptId, principal.workspaceId, principal.agentIdentityId, input.delivered_at,
+        input.final_packet, input.final_packet_sha256, input.local_item_count,
+        JSON.stringify(input.cloud_item_ids)]);
       await bindSessionToWorkThread(client, principal, row.agent_session_id, row.work_thread_id, receiptId, "resolved");
     } else {
       await client.query(`

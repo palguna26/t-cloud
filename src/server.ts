@@ -8,18 +8,20 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import {
   AcknowledgeReceiptRequestSchema,
-  ClaimHandoffRequestSchema,
-  CreateHandoffRequestSchema,
-  CreateWorkRequestSchema,
   EventBatchRequestSchema,
-  DeviceAuthorizationPollRequestSchema,
   DeviceAuthorizationStartRequestSchema,
   ReportOutcomeRequestSchema,
   ResolveContextRequestSchema,
-  RefreshContextRequestSchema,
   TERMYTE_PROTOCOL_VERSION,
   parseProtocol,
 } from "termyte/protocol";
+import {
+  ClaimHandoffRequestSchema,
+  CreateHandoffRequestSchema,
+  CreateWorkRequestSchema,
+  DeviceAuthorizationPollRequestSchema,
+  RefreshContextRequestSchema,
+} from "./legacy-protocol.js";
 import { redactValue } from "termyte/security/redaction";
 import { z } from "zod";
 import Stripe from "stripe";
@@ -729,8 +731,6 @@ export function createApp(
         "events:write",
         "context:read",
         "outcomes:write",
-        "handoffs:create",
-        "handoffs:claim",
       ])).min(1),
       expires_at: z.coerce.date().optional(),
     }).strict().parse(await context.req.json());
@@ -1047,51 +1047,6 @@ export function createApp(
       existing_event_ids: result.existing,
     });
   });
-  app.post("/v1/work", async (context) => {
-    const principal = context.get("principal");
-    if (!hasScope(principal, "events:write")) {
-      return context.json(protocolError("FORBIDDEN", "Credential lacks events:write", context.get("requestId")), 403);
-    }
-    try {
-      const input = parseProtocol(CreateWorkRequestSchema, await context.req.json());
-      return context.json(await createWork(db, principal, input), 201);
-    } catch (error) {
-      if (error instanceof SyntaxError || isValidationError(error)) {
-        return context.json(protocolError("INVALID_ARGUMENT", "Invalid Work Thread request", context.get("requestId")), 400);
-      }
-      throw error;
-    }
-  });
-  app.post("/v1/handoffs", async (context) => {
-    const principal = context.get("principal");
-    if (!hasScope(principal, "handoffs:create")) {
-      return context.json(protocolError("FORBIDDEN", "Credential lacks handoffs:create", context.get("requestId")), 403);
-    }
-    try {
-      const input = parseProtocol(CreateHandoffRequestSchema, await context.req.json());
-      return context.json(await createHandoff(db, principal, input), 201);
-    } catch (error) {
-      if (error instanceof SyntaxError || isValidationError(error)) {
-        return context.json(protocolError("INVALID_ARGUMENT", "Invalid handoff request", context.get("requestId")), 400);
-      }
-      throw error;
-    }
-  });
-  app.post("/v1/handoffs/:id/claim", async (context) => {
-    const principal = context.get("principal");
-    if (!hasScope(principal, "handoffs:claim")) {
-      return context.json(protocolError("FORBIDDEN", "Credential lacks handoffs:claim", context.get("requestId")), 403);
-    }
-    try {
-      const input = parseProtocol(ClaimHandoffRequestSchema, await context.req.json());
-      return context.json(await claimHandoff(db, principal, context.req.param("id"), input));
-    } catch (error) {
-      if (error instanceof SyntaxError || isValidationError(error)) {
-        return context.json(protocolError("INVALID_ARGUMENT", "Invalid handoff claim", context.get("requestId")), 400);
-      }
-      throw error;
-    }
-  });
   app.post("/v1/context/resolve", async (context) => {
     const principal = context.get("principal");
     if (!hasScope(principal, "context:read")) {
@@ -1099,7 +1054,42 @@ export function createApp(
     }
     try {
       const input = parseProtocol(ResolveContextRequestSchema, await context.req.json());
-      return context.json(await resolveContext(db, principal, input));
+      const internal = {
+        ...input,
+        token_budget: input.cloud_token_budget,
+        recent_work_thread_ids: undefined,
+      } as any;
+      const result = await resolveContext(db, principal, internal);
+      if (result.state === "not_found" || result.state === "clarification_required") {
+        return context.json({
+          schema_version: 3,
+          state: "abstained",
+          receipt_id: result.receipt_id ?? "",
+          code: result.state === "clarification_required" ? "low_confidence" : "no_match",
+          message: result.message ?? "No sufficiently confident context match.",
+        });
+      }
+      if (result.state !== "resolved") return context.json(result);
+      return context.json({
+        schema_version: 3,
+        state: "context",
+        receipt_id: result.receipt_id,
+        task_mode: result.task_mode,
+        items: (result.sources ?? []).map((item: any) => ({
+          item_id: item.context_item_id,
+          type: item.type === "objective" || item.type === "current_state" || item.type === "observation" ? "fact" : item.type,
+          text: item.text ?? item.inclusion_reason,
+          status: "observed",
+          confidence: item.confidence ?? 1,
+          task_relevance: 100,
+          company_relevance: 50,
+          task_reason: item.inclusion_reason,
+          company_reason: "Related to the resolved repository task",
+          source: { source_record_id: item.source_event_ids?.[0] ?? item.context_item_id, provider: "agent", title: item.type, occurred_at: Date.now() },
+        })),
+        omitted_count: 0,
+        expires_at: result.expires_at,
+      });
     } catch (error) {
       if (error instanceof SyntaxError || isValidationError(error)) {
         return context.json(protocolError("INVALID_ARGUMENT", "Invalid context request", context.get("requestId")), 400);
@@ -1126,21 +1116,6 @@ export function createApp(
     } catch (error) {
       if (error instanceof SyntaxError || isValidationError(error)) {
         return context.json(protocolError("INVALID_ARGUMENT", "Invalid receipt acknowledgement", context.get("requestId")), 400);
-      }
-      throw error;
-    }
-  });
-  app.post("/v1/context/refresh", async (context) => {
-    const principal = context.get("principal");
-    if (!hasScope(principal, "context:read")) {
-      return context.json(protocolError("FORBIDDEN", "Credential lacks context:read", context.get("requestId")), 403);
-    }
-    try {
-      const input = parseProtocol(RefreshContextRequestSchema, await context.req.json());
-      return context.json(await refreshContext(db, principal, input));
-    } catch (error) {
-      if (error instanceof SyntaxError || isValidationError(error)) {
-        return context.json(protocolError("INVALID_ARGUMENT", "Invalid context refresh request", context.get("requestId")), 400);
       }
       throw error;
     }

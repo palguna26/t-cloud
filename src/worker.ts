@@ -164,7 +164,15 @@ async function projectEvent(
         payload_text: payloadText,
         payload_json: event.payload_json,
       }) };
-    if (projectionResult.items.length === 0) return;
+    if (projectionResult.items.length === 0) {
+      if (projectionResult.fallbackReason) {
+        await client.query(`
+          INSERT INTO audit_events (id, workspace_id, actor_type, actor_id, action, target_type, target_id, metadata_json)
+          VALUES ($1, $2, 'system', 'worker', 'projection.failed', 'source_event', $3, $4)
+        `, [randomUUID(), event.workspace_id, event.id, { source_event_id: event.id, reason: projectionResult.fallbackReason }]);
+      }
+      return;
+    }
     if (event.source_entity_id) {
       await client.query(`
         UPDATE context_items item SET state = 'superseded', updated_at = now()
@@ -519,11 +527,13 @@ export async function runWorker(signal?: AbortSignal): Promise<void> {
     ? {
         encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY),
         webhookSecrets: {},
-        synthesis: config.CONTEXT_SYNTHESIS_BASE_URL && config.CONTEXT_SYNTHESIS_API_KEY && config.CONTEXT_SYNTHESIS_MODEL
+        synthesis: (config.CLOUDFLARE_AI_ACCOUNT_URL ?? config.CONTEXT_SYNTHESIS_BASE_URL)
+          && (config.CLOUDFLARE_AI_API_TOKEN ?? config.CONTEXT_SYNTHESIS_API_KEY)
+          && (config.CLOUDFLARE_AI_MODEL ?? config.CONTEXT_SYNTHESIS_MODEL)
           ? {
-              baseUrl: config.CONTEXT_SYNTHESIS_BASE_URL,
-              apiKey: config.CONTEXT_SYNTHESIS_API_KEY,
-              model: config.CONTEXT_SYNTHESIS_MODEL,
+              baseUrl: config.CLOUDFLARE_AI_ACCOUNT_URL ?? config.CONTEXT_SYNTHESIS_BASE_URL,
+              apiKey: config.CLOUDFLARE_AI_API_TOKEN ?? config.CONTEXT_SYNTHESIS_API_KEY,
+              model: config.CLOUDFLARE_AI_MODEL ?? config.CONTEXT_SYNTHESIS_MODEL,
               timeoutMs: config.CONTEXT_SYNTHESIS_TIMEOUT_MS,
             }
           : undefined,

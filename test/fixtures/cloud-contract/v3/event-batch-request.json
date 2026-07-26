@@ -1,0 +1,1 @@
+{"schema_version":3,"events":[{"event_id":"event-1","event_type":"session_started","agent_session_id":"session-1","occurred_at":1700000000000,"source":{"platform":"codex"}}]}

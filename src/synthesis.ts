@@ -76,16 +76,15 @@ export interface SlackSynthesisResult {
   suggested_summary: string;
   possible_contradictions: string[];
   fallback_reason?: string;
-  mode: "llm" | "fallback";
+  mode: "llm" | "failed";
 }
 
 export async function synthesizeSlackThread(
   input: SlackSynthesisInput,
   runtime: SlackSynthesisRuntime,
 ): Promise<SlackSynthesisResult> {
-  const deterministic = fallbackSlackSynthesis(input);
   if (!runtime.baseUrl || !runtime.apiKey || !runtime.model) {
-    return { ...deterministic, mode: "fallback", fallback_reason: "missing_synthesis_config" };
+    return { candidates: [], suggested_summary: "", possible_contradictions: [], mode: "failed", fallback_reason: "missing_synthesis_config" };
   }
   const request = runtime.fetch ?? fetch;
   const payload = {
@@ -167,12 +166,13 @@ export async function synthesizeSlackThread(
       };
     } catch {
       if (attempt === 0) continue;
-      return { ...deterministic, mode: "fallback", fallback_reason: "llm_unavailable_or_invalid" };
+      return { candidates: [], suggested_summary: "", possible_contradictions: [], mode: "failed", fallback_reason: "llm_unavailable_or_invalid" };
     }
   }
-  return { ...deterministic, mode: "fallback", fallback_reason: "llm_unavailable_or_invalid" };
+  return { candidates: [], suggested_summary: "", possible_contradictions: [], mode: "failed", fallback_reason: "llm_unavailable_or_invalid" };
 }
 
+/** Kept for old callers; production projection must use the model path above. */
 export function fallbackSlackSynthesis(input: SlackSynthesisInput): Omit<SlackSynthesisResult, "mode"> {
   const lines = input.snapshot.messages.map((message) => message.text.trim()).filter(Boolean);
   if (lines.length === 0) {
