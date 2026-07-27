@@ -11,8 +11,7 @@ import type pg from "pg";
 import { redactValue } from "termyte/security/redaction";
 import type { Database } from "./db.js";
 import { transaction } from "./db.js";
-import { ForbiddenError, NotFoundError } from "./work.js";
-import type { SlackSynthesisRuntime } from "./synthesis.js";
+import { ForbiddenError, NotFoundError } from "./errors.js";
 
 export const CONNECTOR_PROVIDERS = ["github", "slack"] as const;
 export type ConnectorProvider = typeof CONNECTOR_PROVIDERS[number];
@@ -21,7 +20,7 @@ export interface ConnectorRuntime {
   encryptionKey: Buffer;
   github?: { appSlug: string };
   slack?: { clientId: string; clientSecret: string };
-  synthesis?: SlackSynthesisRuntime;
+  synthesis?: unknown;
   webhookSecrets: Partial<Record<ConnectorProvider, string>>;
   fetch?: typeof fetch;
 }
@@ -375,108 +374,34 @@ export async function ingestConnectorWebhook(
       .update(`${event.entityKey}\0${event.occurredAt.toISOString()}\0${contentHash}`)
       .digest("hex");
     const duplicate = (await client.query<{ id: string }>(`
-      SELECT id FROM source_events
-      WHERE workspace_id = $1 AND source = $2 AND provider_event_id = $3
+      SELECT id FROM alpha_source_records
+      WHERE workspace_id = $1 AND provider = $2 AND external_id = $3
     `, [connection.workspace_id, event.provider, providerEventId])).rows[0];
     if (duplicate) {
       return { accepted: false, duplicate: true, source_event_id: duplicate.id };
     }
-    const proposedEntityId = randomUUID();
-    await client.query(`
-      INSERT INTO source_entities (id, workspace_id, source, entity_key)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (workspace_id, source, entity_key) DO NOTHING
-    `, [proposedEntityId, connection.workspace_id, event.provider, event.entityKey]);
-    const entity = (await client.query<{
-      id: string;
-      current_source_event_id: string | null;
-      work_thread_id: string | null;
-    }>(`
-      SELECT id, current_source_event_id, work_thread_id
-      FROM source_entities
-      WHERE workspace_id = $1 AND source = $2 AND entity_key = $3
-      FOR UPDATE
-    `, [connection.workspace_id, event.provider, event.entityKey])).rows[0]!;
-    const current = entity.current_source_event_id
-      ? (await client.query<{ content_hash: string | null; occurred_at: Date }>(`
-          SELECT content_hash, occurred_at FROM source_events WHERE id = $1
-        `, [entity.current_source_event_id])).rows[0]
-      : undefined;
-    if (current?.content_hash === contentHash) {
-      return { accepted: false, duplicate: true, source_event_id: entity.current_source_event_id };
-    }
-    const previous = (await client.query<{ id: string }>(`
-      SELECT id FROM source_events
-      WHERE source_entity_id = $1 AND occurred_at <= $2
-      ORDER BY occurred_at DESC, received_at DESC LIMIT 1
-    `, [entity.id, event.occurredAt])).rows[0];
-    const becomesCurrent = !current || event.occurredAt.getTime() >= current.occurred_at.getTime();
     const sourceId = randomUUID();
     await client.query(`
-      INSERT INTO source_events (
-        id, workspace_id, work_thread_id, connector_connection_id, source, external_id,
-        event_type, occurred_at, schema_version, payload_json, payload_text,
-        redaction_state, content_hash, canonical_url, provider_updated_at,
-        source_entity_id, supersedes_source_event_id, provider_event_id
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11, $12, $13, $14,
-        $15, $16, $17
-      )
+      INSERT INTO alpha_source_records
+        (id, workspace_id, provider, external_id, record_type, repository, content, source_url, event_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      ON CONFLICT (workspace_id, provider, external_id) DO NOTHING
     `, [
       sourceId,
       connection.workspace_id,
-      entity.work_thread_id,
-      connection.id,
       event.provider,
-      event.entityKey,
-      event.eventType,
-      event.occurredAt,
-      {
-        title: redacted.value.title,
-        text: redacted.value.text,
-        raw: redacted.value.raw,
-        external_scope_id: scopedEvent.externalScopeId,
-        repository_key: scopedEvent.repositoryKey,
-      },
-      redacted.value.text,
-      redacted.redaction.applied ? "server" : "connector",
-      contentHash,
-      event.canonicalUrl ?? null,
-      event.providerUpdatedAt ?? null,
-      entity.id,
-      previous?.id ?? null,
       providerEventId,
+      event.eventType,
+      scopedEvent.repositoryKey ?? null,
+      redacted.value.text,
+      event.canonicalUrl ?? null,
+      event.occurredAt,
     ]);
-    if (!becomesCurrent) {
-      return { accepted: true, duplicate: false, current: false, source_event_id: sourceId };
-    }
-    await client.query(`
-      UPDATE source_entities
-      SET current_source_event_id = $1, updated_at = now()
-      WHERE id = $2
-    `, [sourceId, entity.id]);
-    let link;
-    if (entity.work_thread_id) {
-      const linkId = randomUUID();
-      await client.query(`
-        INSERT INTO source_event_links (
-          id, workspace_id, source_event_id, work_thread_id, reason,
-          confidence, state, evidence_json
-        ) VALUES ($1, $2, $3, $4, 'new immutable version of linked source', 1, 'automatic', $5)
-      `, [linkId, connection.workspace_id, sourceId, entity.work_thread_id, {
-        repository_key: mappedRepository ?? null,
-        provider: event.provider,
-      }]);
-      await enqueueProjection(client, connection.workspace_id, sourceId);
-      link = { id: linkId, work_thread_id: entity.work_thread_id, state: "automatic", confidence: 1 };
-    } else {
-      link = await linkConnectorEvent(client, connection, entity.id, sourceId, scopedEvent);
-    }
     await client.query(`
       UPDATE connector_connections SET last_synced_at = now(), last_error = NULL, updated_at = now()
       WHERE id = $1
     `, [connection.id]);
-    return { accepted: true, duplicate: false, current: true, source_event_id: sourceId, link };
+    return { accepted: true, duplicate: false, source_event_id: sourceId };
   });
 }
 
@@ -503,16 +428,10 @@ export async function enqueueSlackThreadSync(
       .update(`${event.entityKey}\0${event.occurredAt.toISOString()}\0${event.text}`)
       .digest("hex");
     const result = await client.query(`
-      INSERT INTO jobs (id, workspace_id, kind, dedupe_key, payload_json, state)
-      VALUES ($1, $2, 'sync_slack_thread', $3, $4, 'pending')
-      ON CONFLICT (kind, dedupe_key) DO UPDATE SET
-        payload_json = excluded.payload_json,
-        state = 'pending', leased_by = NULL, lease_until = NULL,
-        next_run_at = now(), updated_at = now()
-      WHERE jobs.payload_json->>'provider_event_id'
-        IS DISTINCT FROM excluded.payload_json->>'provider_event_id'
+      INSERT INTO alpha_sync_jobs (id, workspace_id, provider, payload_json, state)
+      VALUES ($1, $2, 'slack', $3, 'pending')
       RETURNING id
-    `, [randomUUID(), connection.workspace_id, event.entityKey, {
+    `, [randomUUID(), connection.workspace_id, {
       connection_id: connection.id,
       team_id: event.externalAccountId,
       channel_id: channelId,
@@ -598,184 +517,6 @@ export async function syncSlackThread(
     raw: { thread_ts: threadTs, messages: normalizedMessages },
   });
 }
-
-async function linkConnectorEvent(
-  client: pg.PoolClient,
-  connection: { id: string; workspace_id: string },
-  sourceEntityId: string,
-  sourceEventId: string,
-  event: NormalizedConnectorEvent,
-) {
-  const mapped = event.repositoryKey ?? (event.externalScopeId
-    ? (await client.query<{ repository_key: string }>(`
-        SELECT repository_key FROM connector_scope_mappings
-        WHERE connector_connection_id = $1 AND external_scope_id = $2
-      `, [connection.id, event.externalScopeId])).rows[0]?.repository_key
-    : undefined);
-  const candidate = (await client.query<{
-    id: string;
-    repository_key: string | null;
-    score: number;
-  }>(`
-    SELECT id, repository_key,
-      GREATEST(
-        similarity(title, $3),
-        ts_rank(
-          to_tsvector('english', coalesce(title, '') || ' ' || coalesce(objective, '') || ' ' || coalesce(current_summary, '')),
-          plainto_tsquery('english', $4)
-        )
-      )::float8 AS score
-    FROM work_threads
-    WHERE workspace_id = $1 AND deleted_at IS NULL
-      AND status IN ('proposed', 'active', 'blocked', 'in_review')
-      AND ($2::text IS NULL OR repository_key = $2)
-    ORDER BY score DESC, updated_at DESC
-    LIMIT 1
-  `, [connection.workspace_id, mapped ?? null, event.title, `${event.title} ${event.text}`])).rows[0];
-
-  let workThreadId = candidate?.id;
-  let state: "automatic" | "proposed" = "automatic";
-  let confidence = Math.min(0.99, Math.max(0.6, candidate?.score ?? 0));
-  let reason = mapped ? "repository mapping and matching work" : "matching work";
-
-  if (!candidate || candidate.score < 0.08) {
-    workThreadId = randomUUID();
-    await client.query(`
-      INSERT INTO work_threads (
-        id, workspace_id, title, objective, status, current_summary,
-        repository_key, idempotency_key
-      ) VALUES ($1, $2, $3, $4, 'proposed', $5, $6, $7)
-    `, [
-      workThreadId,
-      connection.workspace_id,
-      event.title.slice(0, 500),
-      event.text.slice(0, 10_000),
-      `Created from ${event.provider} organizational context`,
-      mapped ?? null,
-      `connector:${event.provider}:${event.externalId}`,
-    ]);
-    await client.query(`
-      INSERT INTO work_thread_agent_grants (
-        id, workspace_id, work_thread_id, agent_identity_id, source
-      )
-      SELECT gen_random_uuid(), $1, $2, id, 'human'
-      FROM agent_identities
-      WHERE workspace_id = $1 AND status = 'active'
-        AND kind IN ('claude-code', 'codex', 'opencode')
-    `, [connection.workspace_id, workThreadId]);
-    confidence = mapped ? 0.9 : 0.65;
-    reason = mapped ? "new work in an administrator-mapped repository" : "new organizational work";
-  }
-
-  const crossRepository = Boolean(
-    mapped && candidate?.repository_key && candidate.repository_key !== mapped,
-  );
-  if (crossRepository) state = "proposed";
-  if (state === "automatic") {
-    await client.query(`
-      UPDATE source_entities SET work_thread_id = $1, updated_at = now()
-      WHERE id = $2
-    `, [workThreadId, sourceEntityId]);
-  }
-  const linkId = randomUUID();
-  await client.query(`
-    INSERT INTO source_event_links (
-      id, workspace_id, source_event_id, work_thread_id, reason,
-      confidence, state, cross_repository, evidence_json
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    ON CONFLICT (source_event_id, work_thread_id)
-    DO UPDATE SET reason = excluded.reason, confidence = excluded.confidence,
-      evidence_json = excluded.evidence_json
-  `, [
-    linkId,
-    connection.workspace_id,
-    sourceEventId,
-    workThreadId,
-    reason,
-    confidence,
-    state,
-    crossRepository,
-    { repository_key: mapped ?? null, provider: event.provider },
-  ]);
-  if (state === "automatic") {
-    await enqueueProjection(client, connection.workspace_id, sourceEventId);
-  }
-  return { id: linkId, work_thread_id: workThreadId, state, confidence };
-}
-
-export async function listConnectorAttention(
-  db: Database,
-  userId: string,
-  workspaceId: string,
-) {
-  await requireMember(db, userId, workspaceId);
-  return (await db.query(`
-    SELECT l.id, l.source_event_id, l.work_thread_id, l.reason, l.confidence,
-      l.cross_repository, l.evidence_json, l.created_at,
-      se.source AS provider, se.payload_text, se.canonical_url,
-      w.title AS work_thread_title, w.repository_key
-    FROM source_event_links l
-    JOIN source_events se ON se.id = l.source_event_id
-    JOIN work_threads w ON w.id = l.work_thread_id
-    WHERE l.workspace_id = $1 AND l.state = 'proposed'
-    ORDER BY l.created_at DESC
-  `, [workspaceId])).rows;
-}
-
-export async function decideSourceLink(
-  db: Database,
-  userId: string,
-  workspaceId: string,
-  linkId: string,
-  accept: boolean,
-) {
-  return transaction(db, async (client) => {
-    await requireAdmin(client, userId, workspaceId);
-    const link = (await client.query<{
-      source_event_id: string;
-      work_thread_id: string;
-    }>(`
-      UPDATE source_event_links
-      SET state = $1, confirmed_by_user_id = $2, confirmed_at = now()
-      WHERE id = $3 AND workspace_id = $4 AND state = 'proposed'
-      RETURNING source_event_id, work_thread_id
-    `, [accept ? "confirmed" : "rejected", userId, linkId, workspaceId])).rows[0];
-    if (!link) throw new NotFoundError();
-    if (accept) {
-      await client.query(`
-        UPDATE source_entities entity
-        SET work_thread_id = $1, updated_at = now()
-        FROM source_events event
-        WHERE event.id = $2 AND entity.id = event.source_entity_id
-      `, [link.work_thread_id, link.source_event_id]);
-      await enqueueProjection(client, workspaceId, link.source_event_id);
-    }
-    await audit(
-      client,
-      workspaceId,
-      userId,
-      accept ? "source_link.confirm" : "source_link.reject",
-      "source_event_link",
-      linkId,
-    );
-    return { state: accept ? "confirmed" : "rejected" };
-  });
-}
-
-async function enqueueProjection(
-  client: pg.PoolClient,
-  workspaceId: string,
-  sourceEventId: string,
-) {
-  await client.query(`
-    INSERT INTO jobs (id, workspace_id, kind, dedupe_key, payload_json, state)
-    VALUES ($1, $2, 'project_event', $3, $4, 'pending')
-    ON CONFLICT (kind, dedupe_key) DO UPDATE
-      SET state = CASE WHEN jobs.state = 'succeeded' THEN 'pending' ELSE jobs.state END,
-        next_run_at = now(), updated_at = now()
-  `, [randomUUID(), workspaceId, sourceEventId, { source_event_id: sourceEventId }]);
-}
-
 export function normalizeConnectorWebhook(
   provider: ConnectorProvider,
   body: Record<string, any>,
@@ -901,3 +642,4 @@ async function audit(
     ) VALUES ($1, $2, 'human', $3, $4, $5, $6, $7)
   `, [randomUUID(), workspaceId, userId, action, targetType, targetId, metadata]);
 }
+

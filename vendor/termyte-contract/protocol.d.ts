@@ -3,7 +3,6 @@ export declare const TERMYTE_PROTOCOL_VERSION: 3;
 export declare const AgentPlatformSchema: z.ZodEnum<{
     codex: "codex";
     "claude-code": "claude-code";
-    opencode: "opencode";
 }>;
 export declare const TaskModeSchema: z.ZodEnum<{
     implement: "implement";
@@ -56,16 +55,6 @@ export declare const AgentScopeSchema: z.ZodEnum<{
     "context:read": "context:read";
     "outcomes:write": "outcomes:write";
 }>;
-export declare const CheckpointTypeSchema: z.ZodEnum<{
-    test_failed: "test_failed";
-    test_passed: "test_passed";
-    change_batch: "change_batch";
-    before_help: "before_help";
-    before_review: "before_review";
-    handoff: "handoff";
-    explicit_refresh: "explicit_refresh";
-    next_prompt: "next_prompt";
-}>;
 export declare const AgentEventSchema: z.ZodObject<{
     event_id: z.ZodString;
     event_type: z.ZodEnum<{
@@ -88,7 +77,6 @@ export declare const AgentEventSchema: z.ZodObject<{
         platform: z.ZodEnum<{
             codex: "codex";
             "claude-code": "claude-code";
-            opencode: "opencode";
         }>;
         external_id: z.ZodOptional<z.ZodString>;
     }, z.core.$strict>;
@@ -122,7 +110,6 @@ export declare const EventBatchRequestSchema: z.ZodObject<{
             platform: z.ZodEnum<{
                 codex: "codex";
                 "claude-code": "claude-code";
-                opencode: "opencode";
             }>;
             external_id: z.ZodOptional<z.ZodString>;
         }, z.core.$strict>;
@@ -367,7 +354,6 @@ export declare const DeviceAuthorizationStartRequestSchema: z.ZodObject<{
     platform: z.ZodEnum<{
         codex: "codex";
         "claude-code": "claude-code";
-        opencode: "opencode";
     }>;
     requested_scopes: z.ZodArray<z.ZodEnum<{
         "events:write": "events:write";
@@ -415,14 +401,5 @@ export type ResolveContextResponse = z.infer<typeof ResolveContextResponseSchema
 export type AcknowledgeReceiptRequest = z.infer<typeof AcknowledgeReceiptRequestSchema>;
 export type ReportOutcomeRequest = z.infer<typeof ReportOutcomeRequestSchema>;
 export type AgentScope = z.infer<typeof AgentScopeSchema>;
-export type CheckpointType = z.infer<typeof CheckpointTypeSchema>;
-export type CreateWorkRequest = Record<string, unknown>;
-export type CreateWorkResponse = Record<string, unknown>;
-export type CreateHandoffRequest = Record<string, unknown>;
-export type CreateHandoffResponse = Record<string, unknown>;
-export type ClaimHandoffRequest = Record<string, unknown>;
-export type ClaimHandoffResponse = Record<string, unknown>;
-export type RefreshContextRequest = Record<string, unknown>;
-export type RefreshContextResponse = Record<string, unknown>;
 export declare const RefreshContextResponseSchema: z.ZodRecord<z.ZodString, z.ZodUnknown>;
 export type DeviceAuthorizationStartRequest = z.infer<typeof DeviceAuthorizationStartRequestSchema>;

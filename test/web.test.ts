@@ -56,11 +56,8 @@ describe("hosted web app", () => {
     expect(device.status).toBe(200);
     expect(script.status).toBe(200);
     const javascript = await script.text();
-    expect(javascript).toContain("function renderWork()");
-    expect(javascript).toContain("function renderConnections()");
-    expect(javascript).toContain("function openDeviceApproval()");
-    expect(javascript).toContain('const userCode = new URLSearchParams(location.search).get("code")');
-    expect(javascript).not.toContain('${["github", "slack", "linear"].map');
+    expect(javascript).toContain("Sources and sessions");
+    expect(javascript).toContain("Connect Slack or GitHub");
     expect(javascript).not.toContain('<option value="custom">');
     expect(javascript).not.toContain('<option value="opencode">');
     expect(styles.status).toBe(200);

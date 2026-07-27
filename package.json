@@ -17,11 +17,7 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "worker": "node dist/worker.js",
-    "migrate": "node dist/migrate.js",
-    "demo:seed": "npm run build && node dist/demo-seed.js",
-    "demo:slack": "npm run build && node dist/demo-slack.js",
-    "plan:override": "node scripts/set-plan-override.mjs",
-    "capacity": "npm run build && node scripts/capacity-test.mjs"
+    "migrate": "node dist/migrate.js"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.11",

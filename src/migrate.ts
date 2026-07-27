@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDatabase, type Database } from "./db.js";
@@ -20,7 +20,7 @@ export async function migrate(db: Database): Promise<string[]> {
     const known = new Set((await client.query<{ name: string }>(
       `SELECT name FROM schema_migrations`,
     )).rows.map((row) => row.name));
-    for (const name of readdirSync(migrationDirectory).filter((file) => file.endsWith(".sql")).sort()) {
+    for (const name of ["001_alpha.sql"]) {
       if (known.has(name)) continue;
       await client.query(readFileSync(join(migrationDirectory, name), "utf8"));
       await client.query(`INSERT INTO schema_migrations (name) VALUES ($1)`, [name]);

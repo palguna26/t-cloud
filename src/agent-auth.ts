@@ -56,8 +56,7 @@ export async function authenticateAgent(
     auth_kind: "credential" | "device";
     context_delivery_enabled: boolean;
   }>(`
-    SELECT auth.*, a.kind,
-      (a.context_delivery_enabled AND w.context_delivery_enabled) AS context_delivery_enabled
+    SELECT auth.*, a.kind, true AS context_delivery_enabled
     FROM (
       SELECT c.id, c.workspace_id, c.agent_identity_id, c.secret_hash, c.scopes,
         'credential'::text AS auth_kind
@@ -76,7 +75,7 @@ export async function authenticateAgent(
     JOIN agent_identities a
       ON a.id = auth.agent_identity_id AND a.workspace_id = auth.workspace_id
     JOIN workspaces w ON w.id = auth.workspace_id
-    WHERE a.status = 'active' AND w.deletion_requested_at IS NULL
+    WHERE a.status = 'active'
     LIMIT 1
   `, [parsed.prefix]);
   const row = result.rows[0];

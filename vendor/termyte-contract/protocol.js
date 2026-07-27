@@ -5,7 +5,7 @@ const text = z.string().trim().min(1).max(100_000);
 const shortText = z.string().trim().min(1).max(2_000);
 const timestamp = z.number().int().nonnegative();
 const versioned = { schema_version: z.literal(TERMYTE_PROTOCOL_VERSION) };
-export const AgentPlatformSchema = z.enum(["codex", "claude-code", "opencode"]);
+export const AgentPlatformSchema = z.enum(["codex", "claude-code"]);
 export const TaskModeSchema = z.enum(["implement", "investigate", "review", "verify", "continue", "general"]);
 export const TrustStatusSchema = z.enum(["observed", "inferred", "verified", "proposed", "conflicting", "stale"]);
 export const SourceProviderSchema = z.enum(["local", "github", "slack", "agent"]);
@@ -13,7 +13,6 @@ export const DeliveryStatusSchema = z.enum(["delivered", "failed"]);
 export const AbstentionCodeSchema = z.enum(["low_confidence", "no_match", "no_authorized_sources", "no_indexed_sources"]);
 export const AgentEventTypeSchema = z.enum(["session_started", "user_prompt", "observation", "decision", "constraint", "action", "attempt", "failure", "evidence", "status_changed", "outcome", "session_ended"]);
 export const AgentScopeSchema = z.enum(["events:write", "context:read", "outcomes:write"]);
-export const CheckpointTypeSchema = z.enum(["test_failed", "test_passed", "change_batch", "before_help", "before_review", "handoff", "explicit_refresh", "next_prompt"]);
 export const AgentEventSchema = z.object({
     event_id: id, event_type: AgentEventTypeSchema, agent_session_id: id, occurred_at: timestamp,
     source: z.object({ platform: AgentPlatformSchema, external_id: id.optional() }).strict(),
@@ -58,4 +57,3 @@ export class UnsupportedProtocolVersionError extends Error {
 export function parseProtocol(schema, input) { const received = input && typeof input === "object" ? input.schema_version : undefined; if (received !== TERMYTE_PROTOCOL_VERSION)
     throw new UnsupportedProtocolVersionError(received); return schema.parse(input); }
 export const RefreshContextResponseSchema = z.record(z.string(), z.unknown());
-//# sourceMappingURL=protocol.js.map

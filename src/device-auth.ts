@@ -3,7 +3,7 @@ import type { AgentPlatform, AgentScope } from "termyte/protocol";
 import { TERMYTE_PROTOCOL_VERSION } from "termyte/protocol";
 import { issueAgentCredential } from "./agent-auth.js";
 import { transaction, type Database } from "./db.js";
-import { ConflictError, ForbiddenError, NotFoundError } from "./work.js";
+import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 
 const FLOW_TTL_MS = 10 * 60_000;
 const POLL_INTERVAL_SECONDS = 3;
