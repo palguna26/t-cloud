@@ -129,6 +129,15 @@ export function createApp(
 ): Hono<{ Variables: Variables }> {
   const app = new Hono<{ Variables: Variables }>();
   const metrics = new ServiceMetrics();
+  // PRD alpha surface: keep workspace/source/session views, but do not expose
+  // the later Work Thread administration model.
+  app.use("/v1/admin/*", async (context, next) => {
+    const path = context.req.path;
+    if (/\/(work-threads|receipts|outcomes|grants|resolution-attempts|audit|usage|export|retention|context-delivery|devices|credentials|members)(\/|$)/.test(path)) {
+      return context.json({ error: "Not found" }, 404);
+    }
+    await next();
+  });
   app.use("*", async (context, next) => {
     const startedAt = performance.now();
     context.set("requestId", context.req.header("x-request-id") ?? randomUUID());

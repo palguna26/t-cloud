@@ -21,7 +21,6 @@ export interface ConnectorRuntime {
   encryptionKey: Buffer;
   github?: { appSlug: string };
   slack?: { clientId: string; clientSecret: string };
-  linear?: { clientId: string; clientSecret: string };
   synthesis?: SlackSynthesisRuntime;
   webhookSecrets: Partial<Record<ConnectorProvider, string>>;
   fetch?: typeof fetch;
@@ -99,12 +98,7 @@ export function verifyConnectorWebhook(
       `v0=${createHmac("sha256", secret).update(`v0:${timestamp}:${rawBody}`).digest("hex")}`,
     );
   }
-  const timestamp = headers.get("webhook-timestamp");
-  if (!timestamp || Math.abs(now - Number(timestamp)) > 60_000) return false;
-  return matchesMac(
-    headers.get("linear-signature"),
-    createHmac("sha256", secret).update(rawBody).digest("hex"),
-  );
+  return false;
 }
 
 function matchesMac(received: string | null, expected: string): boolean {
@@ -148,15 +142,7 @@ export async function startConnectorOAuth(
     );
     authorizationUrl.searchParams.set("redirect_uri", callback);
     authorizationUrl.searchParams.set("state", state);
-  } else {
-    if (!runtime.linear) throw new Error("Linear OAuth is not configured");
-    authorizationUrl = new URL("https://linear.app/oauth/authorize");
-    authorizationUrl.searchParams.set("client_id", runtime.linear.clientId);
-    authorizationUrl.searchParams.set("redirect_uri", callback);
-    authorizationUrl.searchParams.set("response_type", "code");
-    authorizationUrl.searchParams.set("scope", "read");
-    authorizationUrl.searchParams.set("state", state);
-  }
+  } else throw new Error(`Unsupported connector provider: ${provider}`);
   return { authorization_url: authorizationUrl.toString() };
 }
 
@@ -267,46 +253,7 @@ async function exchangeProvider(
       credentials: { access_token: value.access_token },
     };
   }
-  if (!runtime.linear) throw new Error("Linear OAuth is not configured");
-  const response = await request("https://api.linear.app/oauth/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: runtime.linear.clientId,
-      client_secret: runtime.linear.clientSecret,
-      code: input.code,
-      redirect_uri: callback,
-      grant_type: "authorization_code",
-    }),
-  });
-  const token = await response.json() as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-  };
-  if (!response.ok || !token.access_token) throw new Error(`Linear OAuth failed: ${response.status}`);
-  const organization = await request("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token.access_token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ query: "{ organization { id name } }" }),
-  });
-  const organizationValue = await organization.json() as {
-    data?: { organization?: { id?: string; name?: string } };
-  };
-  const org = organizationValue.data?.organization;
-  if (!organization.ok || !org?.id) throw new Error("Linear organization lookup failed");
-  return {
-    externalAccountId: org.id,
-    name: org.name ?? `Linear ${org.id}`,
-    credentials: {
-      access_token: token.access_token,
-      refresh_token: token.refresh_token,
-      expires_in: token.expires_in,
-    },
-  };
+  throw new Error(`Unsupported connector provider: ${provider}`);
 }
 
 export async function listConnectors(db: Database, userId: string, workspaceId: string) {
@@ -887,7 +834,7 @@ export function normalizeConnectorWebhook(
   const data = body.data;
   const organizationId = body.organizationId ?? body.organization?.id;
   if (!organizationId || !data?.id) return null;
-  const type = String(body.type ?? "Linear");
+  const type = String(body.type ?? "event");
   const entityKey = `${type}:${data.id}`;
   const title = String(data.title ?? data.body?.slice?.(0, 120) ?? `${type} update`);
   return {

@@ -56,17 +56,6 @@ describe("connector security", () => {
     expect(verifyConnectorWebhook("slack", body, headers, secret, now + 301_000)).toBe(false);
   });
 
-  it("verifies Linear signatures and rejects stale requests", () => {
-    const now = 1_800_000_000_000;
-    const body = JSON.stringify({ type: "Issue" });
-    const secret = "linear-webhook-secret";
-    const headers = new Headers({
-      "webhook-timestamp": String(now),
-      "linear-signature": createHmac("sha256", secret).update(body).digest("hex"),
-    });
-    expect(verifyConnectorWebhook("linear", body, headers, secret, now)).toBe(true);
-    expect(verifyConnectorWebhook("linear", body, headers, secret, now + 61_000)).toBe(false);
-  });
 });
 
 describe("connector normalization", () => {
@@ -156,26 +145,4 @@ describe("connector normalization", () => {
     });
   });
 
-  it("normalizes Linear issues with team scope", () => {
-    const event = normalizeConnectorWebhook("linear", {
-      organizationId: "org-1",
-      type: "Issue",
-      action: "create",
-      data: {
-        id: "issue-1",
-        teamId: "team-1",
-        title: "Fix the authentication refresh bug",
-        description: "Keep existing sessions active.",
-        url: "https://linear.app/acme/issue/AUTH-1",
-        createdAt: "2026-07-24T00:00:00Z",
-      },
-    }, new Headers());
-    expect(event).toMatchObject({
-      externalAccountId: "org-1",
-      externalId: "Issue:issue-1",
-      externalScopeId: "team-1",
-      entityKey: "Issue:issue-1",
-      eventType: "decision",
-    });
-  });
 });
