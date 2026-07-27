@@ -3,8 +3,6 @@ import { pathToFileURL } from "node:url";
 import type pg from "pg";
 import { loadConfig } from "./config.js";
 import { createDatabase, transaction, type Database } from "./db.js";
-import { processStripeEvent } from "./billing.js";
-import type Stripe from "stripe";
 import { connectorKey, syncSlackThread, type ConnectorRuntime } from "./connectors.js";
 import { synthesizeSlackThread } from "./synthesis.js";
 
@@ -508,9 +506,6 @@ export async function runOneJob(
     }
     else if (job.kind === "enforce_retention") await enforceRetention(db, job);
     else if (job.kind === "delete_workspace") await deleteWorkspace(db, job);
-    else if (job.kind === "stripe_event") {
-      await processStripeEvent(db, job.payload_json as unknown as Stripe.Event);
-    }
     else throw new Error(`Unsupported job kind: ${job.kind}`);
     await transaction(db, (client) => complete(client, job));
   } catch (error) {

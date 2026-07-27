@@ -250,18 +250,23 @@ export async function resolveContext(
           input.recent_work_thread_ids,
         );
         if (candidates.length === 0) {
-          return recordResolutionAttempt(client, principal, input, {
-            schema_version: TERMYTE_PROTOCOL_VERSION,
-            state: "not_found",
-            message: "No permitted work matched this request.",
-          }, [], {
-            task_mode: taskMode,
-            selected_rule: "not_found",
-            threshold: 0.75,
-            margin: 0.25,
-            candidates: [],
-          });
-        }
+          selectedId = randomUUID();
+          await client.query(`
+            INSERT INTO work_threads
+              (id, workspace_id, title, objective, status, repository_key, idempotency_key,
+               created_by_agent_identity_id)
+            VALUES ($1, $2, $3, $4, 'proposed', $5, $6, $7)
+          `, [selectedId, principal.workspaceId, input.request_text.slice(0, 500),
+            input.request_text, input.repository_key ?? null,
+            `resolve:${principal.agentIdentityId}:${input.agent_session_id}:${input.idempotency_key}`,
+            principal.agentIdentityId]);
+          await client.query(`
+            INSERT INTO work_thread_agent_grants
+              (id, workspace_id, work_thread_id, agent_identity_id, source)
+            VALUES ($1, $2, $3, $4, 'contribution')
+          `, [randomUUID(), principal.workspaceId, selectedId, principal.agentIdentityId]);
+          selectedRule = "automatic";
+        } else {
         const ranked = candidates.map((candidate) => {
           const recent = input.recent_work_thread_ids?.includes(candidate.id) ?? false;
           const score = candidateScore(input.request_text, candidate, recent, taskMode);
@@ -326,6 +331,7 @@ export async function resolveContext(
             selectedHandoffId,
             input.agent_session_id,
           );
+        }
         }
       }
     }
@@ -480,6 +486,7 @@ export async function resolveContext(
         context_item_count: briefing.items.length,
       },
     ]);
+    await bindSessionToWorkThread(client, principal, input.agent_session_id, work.id, receiptId, "resolved");
     return {
       schema_version: TERMYTE_PROTOCOL_VERSION,
       state: "resolved",
@@ -494,6 +501,7 @@ export async function resolveContext(
         context_item_id: item.id,
         type: item.type,
         source_event_ids: item.source_event_ids,
+        text: item.text,
         inclusion_reason: `Active ${item.type} for the resolved Work Thread`,
       })),
       expires_at: Date.now() + 5 * 60_000,

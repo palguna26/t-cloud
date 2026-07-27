@@ -9,10 +9,6 @@ const ConfigSchema = z.object({
   DEMO_USER_ID: z.string().uuid().optional(),
   SUPABASE_URL: z.string().url().optional(),
   SUPABASE_ANON_KEY: z.string().min(1).optional(),
-  STRIPE_SECRET_KEY: z.string().min(1).optional(),
-  STRIPE_WEBHOOK_SECRET: z.string().min(1).optional(),
-  STRIPE_PRICE_ID: z.string().min(1).optional(),
-  METRICS_TOKEN: z.string().min(32).optional(),
   CONNECTOR_ENCRYPTION_KEY: z.string().optional(),
   CONTEXT_SYNTHESIS_BASE_URL: z.string().url().optional(),
   CONTEXT_SYNTHESIS_API_KEY: z.string().min(1).optional(),
@@ -27,9 +23,6 @@ const ConfigSchema = z.object({
   SLACK_CLIENT_ID: z.string().min(1).optional(),
   SLACK_CLIENT_SECRET: z.string().min(1).optional(),
   SLACK_SIGNING_SECRET: z.string().min(16).optional(),
-  LINEAR_CLIENT_ID: z.string().min(1).optional(),
-  LINEAR_CLIENT_SECRET: z.string().min(1).optional(),
-  LINEAR_WEBHOOK_SECRET: z.string().min(16).optional(),
 });
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {

@@ -14,7 +14,7 @@ import { transaction } from "./db.js";
 import { ForbiddenError, NotFoundError } from "./work.js";
 import type { SlackSynthesisRuntime } from "./synthesis.js";
 
-export const CONNECTOR_PROVIDERS = ["github", "slack", "linear"] as const;
+export const CONNECTOR_PROVIDERS = ["github", "slack"] as const;
 export type ConnectorProvider = typeof CONNECTOR_PROVIDERS[number];
 
 export interface ConnectorRuntime {
@@ -409,7 +409,7 @@ export async function ingestConnectorWebhook(
           WHERE connector_connection_id = $1 AND external_scope_id = $2
         `, [connection.id, event.externalScopeId])).rows[0]?.repository_key
       : undefined;
-    if ((event.provider === "slack" || event.provider === "linear") && !mappedRepository) {
+    if (event.provider === "slack" && !mappedRepository) {
       return { accepted: false, duplicate: false, ignored: "scope_not_selected" };
     }
     const scopedEvent = {

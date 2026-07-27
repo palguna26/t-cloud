@@ -24,7 +24,6 @@ import {
 } from "./legacy-protocol.js";
 import { redactValue } from "termyte/security/redaction";
 import { z } from "zod";
-import Stripe from "stripe";
 import { authenticateAgent, hasScope, type AgentPrincipal } from "./agent-auth.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, transaction, type Database } from "./db.js";
@@ -88,11 +87,6 @@ import {
   listResolutionAttempts,
   resolveResolutionAttempt,
 } from "./admin.js";
-import {
-  createCheckout,
-  createPortal,
-  enqueueStripeEvent,
-} from "./billing.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
 import {
@@ -124,9 +118,6 @@ export interface CreateAppOptions {
   demoUserId?: string;
   webAuth?: { supabaseUrl: string; anonKey: string };
   publicAppUrl?: string;
-  stripe?: Stripe;
-  stripePriceId?: string;
-  stripeWebhookSecret?: string;
   metricsToken?: string;
   connectorRuntime?: ConnectorRuntime;
 }
@@ -214,23 +205,6 @@ export function createApp(
     exposeHeaders: ["content-disposition", "x-request-id"],
     maxAge: 600,
   }));
-  app.post("/webhooks/stripe", async (context) => {
-    if (!options.stripe || !options.stripeWebhookSecret) {
-      return context.json({ received: false }, 503);
-    }
-    const signature = context.req.header("stripe-signature");
-    if (!signature) return context.json({ received: false }, 400);
-    try {
-      const event = await options.stripe.webhooks.constructEventAsync(
-        await context.req.text(),
-        signature,
-        options.stripeWebhookSecret,
-      );
-      return context.json(await enqueueStripeEvent(db, event));
-    } catch {
-      return context.json({ received: false }, 400);
-    }
-  });
   app.use("/webhooks/connectors/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.post("/webhooks/connectors/:provider", async (context) => {
     const provider = context.req.param("provider") as ConnectorProvider;
@@ -883,35 +857,6 @@ export function createApp(
       input.confirmation_slug,
     ), 202);
   });
-  app.post("/v1/admin/billing/checkout", async (context) => {
-    if (!options.stripe || !options.stripePriceId) {
-      return context.json({ error: "Billing is not configured" }, 503);
-    }
-    const input = z.object({ workspace_id: z.string().uuid() }).strict()
-      .parse(await context.req.json());
-    return context.json(await createCheckout(
-      db,
-      options.stripe,
-      context.get("humanUserId"),
-      input.workspace_id,
-      options.stripePriceId,
-      options.publicAppUrl ?? "http://localhost:3000",
-    ));
-  });
-  app.post("/v1/admin/billing/portal", async (context) => {
-    if (!options.stripe) {
-      return context.json({ error: "Billing is not configured" }, 503);
-    }
-    const input = z.object({ workspace_id: z.string().uuid() }).strict()
-      .parse(await context.req.json());
-    return context.json(await createPortal(
-      db,
-      options.stripe,
-      context.get("humanUserId"),
-      input.workspace_id,
-      options.publicAppUrl ?? "http://localhost:3000",
-    ));
-  });
   app.post("/v1/events/batch", async (context) => {
     const principal = context.get("principal");
     if (!hasScope(principal, "events:write")) {
@@ -995,7 +940,7 @@ export function createApp(
             event.repository_key ?? null, `session:${internalSessionId}`, principal.agentIdentityId]);
           await client.query(`
             INSERT INTO work_thread_agent_grants (id, workspace_id, work_thread_id, agent_identity_id, source)
-            VALUES ($1, $2, $3, $4, 'automatic') ON CONFLICT DO NOTHING
+            VALUES ($1, $2, $3, $4, 'contribution') ON CONFLICT DO NOTHING
           `, [randomUUID(), principal.workspaceId, internalWorkThreadId, principal.agentIdentityId]);
         }
         await client.query(`
@@ -1233,7 +1178,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const authenticateHuman = config.SUPABASE_URL && config.SUPABASE_ANON_KEY
     ? createSupabaseHumanAuthenticator(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
     : undefined;
-  const stripe = config.STRIPE_SECRET_KEY ? new Stripe(config.STRIPE_SECRET_KEY) : undefined;
   const connectorRuntime: ConnectorRuntime | undefined = config.CONNECTOR_ENCRYPTION_KEY
     ? {
         encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY),
@@ -1241,13 +1185,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         slack: config.SLACK_CLIENT_ID && config.SLACK_CLIENT_SECRET
           ? { clientId: config.SLACK_CLIENT_ID, clientSecret: config.SLACK_CLIENT_SECRET }
           : undefined,
-        linear: config.LINEAR_CLIENT_ID && config.LINEAR_CLIENT_SECRET
-          ? { clientId: config.LINEAR_CLIENT_ID, clientSecret: config.LINEAR_CLIENT_SECRET }
-          : undefined,
         webhookSecrets: {
           github: config.GITHUB_WEBHOOK_SECRET,
           slack: config.SLACK_SIGNING_SECRET,
-          linear: config.LINEAR_WEBHOOK_SECRET,
         },
       }
     : undefined;
@@ -1259,10 +1199,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         ? { supabaseUrl: config.SUPABASE_URL, anonKey: config.SUPABASE_ANON_KEY }
         : undefined,
       publicAppUrl: config.PUBLIC_APP_URL,
-      stripe,
-      stripePriceId: config.STRIPE_PRICE_ID,
-      stripeWebhookSecret: config.STRIPE_WEBHOOK_SECRET,
-      metricsToken: config.METRICS_TOKEN,
       connectorRuntime,
     }).fetch,
     port: config.PORT,

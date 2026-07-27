@@ -27,7 +27,6 @@
     "@hono/node-server": "^2.0.11",
     "hono": "^4.10.8",
     "pg": "^8.16.3",
-    "stripe": "^22.3.2",
     "termyte": "file:vendor/termyte-contract",
     "zod": "^4.4.3"
   },
