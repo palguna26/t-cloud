@@ -106,6 +106,7 @@ import {
   type ConnectorProvider,
   type ConnectorRuntime,
 } from "./connectors.js";
+import type { ContextLLMRuntime } from "./work.js";
 
 type Variables = {
   principal: AgentPrincipal;
@@ -120,6 +121,7 @@ export interface CreateAppOptions {
   publicAppUrl?: string;
   metricsToken?: string;
   connectorRuntime?: ConnectorRuntime;
+  contextLLM?: ContextLLMRuntime;
 }
 
 export function createApp(
@@ -1043,7 +1045,7 @@ export function createApp(
         token_budget: input.cloud_token_budget,
         recent_work_thread_ids: undefined,
       } as any;
-      const result = await resolveContext(db, principal, internal);
+      const result = await resolveContext(db, principal, internal, options.contextLLM);
       if (result.state === "not_found" || result.state === "clarification_required") {
         return context.json({
           schema_version: 3,
@@ -1209,6 +1211,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         : undefined,
       publicAppUrl: config.PUBLIC_APP_URL,
       connectorRuntime,
+      contextLLM: config.OPENROUTER_API_KEY ? {
+        baseUrl: config.OPENROUTER_BASE_URL,
+        apiKey: config.OPENROUTER_API_KEY,
+        model: config.OPENROUTER_MODEL,
+        timeoutMs: config.OPENROUTER_TIMEOUT_MS,
+      } : undefined,
     }).fetch,
     port: config.PORT,
   });

@@ -522,14 +522,12 @@ export async function runWorker(signal?: AbortSignal): Promise<void> {
     ? {
         encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY),
         webhookSecrets: {},
-        synthesis: (config.CLOUDFLARE_AI_ACCOUNT_URL ?? config.CONTEXT_SYNTHESIS_BASE_URL)
-          && (config.CLOUDFLARE_AI_API_TOKEN ?? config.CONTEXT_SYNTHESIS_API_KEY)
-          && (config.CLOUDFLARE_AI_MODEL ?? config.CONTEXT_SYNTHESIS_MODEL)
+          synthesis: config.OPENROUTER_API_KEY
           ? {
-              baseUrl: config.CLOUDFLARE_AI_ACCOUNT_URL ?? config.CONTEXT_SYNTHESIS_BASE_URL,
-              apiKey: config.CLOUDFLARE_AI_API_TOKEN ?? config.CONTEXT_SYNTHESIS_API_KEY,
-              model: config.CLOUDFLARE_AI_MODEL ?? config.CONTEXT_SYNTHESIS_MODEL,
-              timeoutMs: config.CONTEXT_SYNTHESIS_TIMEOUT_MS,
+              baseUrl: config.OPENROUTER_BASE_URL,
+              apiKey: config.OPENROUTER_API_KEY,
+              model: config.OPENROUTER_MODEL,
+              timeoutMs: config.OPENROUTER_TIMEOUT_MS,
             }
           : undefined,
       }
