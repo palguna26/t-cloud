@@ -623,9 +623,9 @@ export function normalizeConnectorWebhook(
 }
 
 export function parseGitHubReference(text: string): NormalizedConnectorEvent["githubReference"] {
-  const match = text.match(/https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/(\d+)/i);
+  const match = text.match(/(?:https?:\/\/)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/(\d+)/i);
   if (!match) return undefined;
-  return { url: match[0], repositoryKey: `github.com/${match[1]}/${match[2]}`, kind: match[3]!.toLowerCase() === "issues" ? "issue" : "pull", number: match[4]! };
+  return { url: `https://github.com/${match[1]}/${match[2]}/${match[3]}/${match[4]}`, repositoryKey: `github.com/${match[1]}/${match[2]}`, kind: match[3]!.toLowerCase() === "issues" ? "issue" : "pull", number: match[4]! };
 }
 
 function date(value: unknown): Date {

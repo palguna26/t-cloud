@@ -18,6 +18,7 @@
     "start": "node dist/server.js",
     "worker": "node dist/worker.js",
     "migrate": "node dist/migrate.js",
+    "db:migrate": "npm run build && node dist/migrate.js",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
