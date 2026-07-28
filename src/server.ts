@@ -51,6 +51,12 @@ const SessionIngestSchema = z.object({
   started_at: z.string().datetime({ offset: true }),
   completed_at: z.string().datetime({ offset: true }),
 }).strict();
+const ContextRequestSchema = z.object({
+  task: z.string().trim().min(1).max(2_000),
+  repository: z.string().trim().min(1).max(2_000),
+  branch: z.string().trim().min(1).max(2_000).optional(),
+  issue_or_pr: z.string().trim().min(1).max(2_000).optional(),
+}).strict();
 export interface CreateAppOptions {
   authenticateHuman?: HumanAuthenticator;
   demoUserId?: string;
@@ -199,6 +205,28 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     `, [id, input.workspace_id, input.external_session_id, input.agent_type, input.repository, input.branch, input.summary_json, input.started_at, input.completed_at])).rows[0];
     await enqueueExtractionJob(db, input.workspace_id, "agent_session", row!.id, options.extractionVersion ?? "v1");
     return c.json({ session_id: row!.id }, 201);
+  });
+  app.post("/api/v1/context", async (c) => {
+    const principal = c.get("principal");
+    if (!hasScope(principal, "context:read")) return c.json(error("FORBIDDEN", "Credential lacks context:read", c.get("requestId")), 403);
+    const input = ContextRequestSchema.parse(await c.req.json());
+    const memories = (await db.query<{ id: string; memory_type: string; content: string; repository_id: string | null; status: string; event_at: Date }>(`
+      SELECT m.id, m.memory_type, m.content, m.repository_id, m.status, m.event_at
+      FROM memories m
+      WHERE m.workspace_id = $1 AND m.repository_id = $2 AND m.status IN ('active', 'superseded')
+      ORDER BY
+        CASE WHEN $3::text IS NOT NULL AND (m.work_thread_id = $3 OR m.content ILIKE '%' || $3 || '%') THEN 0 ELSE 1 END,
+        CASE WHEN $4::text IS NOT NULL AND EXISTS (
+          SELECT 1 FROM memory_sources ms JOIN agent_sessions s ON s.id = ms.agent_session_id
+          WHERE ms.memory_id = m.id AND s.branch = $4
+        ) THEN 0 ELSE 1 END,
+        CASE WHEN m.content ILIKE '%' || $5 || '%' THEN 0 ELSE 1 END,
+        m.event_at DESC
+      LIMIT 50
+    `, [principal.workspaceId, input.repository, input.issue_or_pr ?? null, input.branch ?? null, input.task])).rows;
+    let briefing = memories.map((memory) => `[${memory.memory_type}] ${memory.content}`).join("\n");
+    if (briefing.length > 3_000) briefing = `${briefing.slice(0, 2_997)}...`;
+    return c.json({ briefing, sources: memories.map((memory) => ({ memory_id: memory.id, memory_type: memory.memory_type, repository: memory.repository_id, status: memory.status, event_at: memory.event_at })) });
   });
 
   app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
