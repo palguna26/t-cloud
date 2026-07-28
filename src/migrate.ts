@@ -20,7 +20,7 @@ export async function migrate(db: Database): Promise<string[]> {
     const known = new Set((await client.query<{ name: string }>(
       `SELECT name FROM schema_migrations`,
     )).rows.map((row) => row.name));
-    for (const name of ["001_alpha.sql"]) {
+    for (const name of ["001_alpha.sql", "002_target_schema.sql"]) {
       if (known.has(name)) continue;
       await client.query(readFileSync(join(migrationDirectory, name), "utf8"));
       await client.query(`INSERT INTO schema_migrations (name) VALUES ($1)`, [name]);
