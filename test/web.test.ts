@@ -83,6 +83,14 @@ describe("hosted web app", () => {
     expect(response.status).toBe(400);
   });
 
+  it("lists recent memories for an authenticated workspace", async () => {
+    const workspaceId = crypto.randomUUID();
+    const app = createApp({ query: async (sql: string) => ({ rows: sql.includes("FROM memories m") ? [{ id: "memory-1", memory_type: "decision", content: "Use SQLite offline", repository_id: "github.com/acme/app", status: "active", event_at: new Date(), created_at: new Date() }] : [], rowCount: 1 }) } as any, "x".repeat(32), { authenticateHuman: async (token) => token === "human" ? { userId: "user-1" } : null });
+    const response = await app.request(`/api/admin/memories?workspace_id=${workspaceId}`, { headers: { authorization: "Bearer human" } });
+    expect(response.status).toBe(200);
+    expect((await response.json() as { memories: unknown[] }).memories).toHaveLength(1);
+  });
+
   it("rejects oversized connector webhooks before parsing them", async () => {
     const app = createApp(db, "x".repeat(32), {
       connectorRuntime: {

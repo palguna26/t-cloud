@@ -142,6 +142,12 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     if (!principal) return c.json(error("UNAUTHENTICATED", "Invalid agent credential", c.get("requestId")), 401);
     c.set("principal", principal); return next();
   });
+  app.use("/api/admin/*", async (c, next) => {
+    const token = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const human = token === "demo" && options.demoUserId ? { userId: options.demoUserId } : options.authenticateHuman ? await options.authenticateHuman(token) : null;
+    if (!human) return c.json(error("UNAUTHENTICATED", "Invalid user session", c.get("requestId")), 401);
+    c.set("humanUserId", human.userId); return next();
+  });
 
   app.post("/v1/device/start", async (c) => {
     if (!await consumeRateLimit(db, `device-start:${c.req.header("x-forwarded-for") ?? "unknown"}`, 20, 600)) return c.json(error("RATE_LIMITED", "Too many requests", c.get("requestId")), 429);
@@ -163,6 +169,17 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.post("/v1/admin/connectors/:provider/start", async (c) => c.json(await startConnectorOAuth(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), z.enum(CONNECTOR_PROVIDERS).parse(c.req.param("provider")), [], options.publicAppUrl ?? "http://localhost:3000", options.connectorRuntime!)));
   app.post("/v1/admin/connectors/:id/scopes", async (c) => { const input = z.object({ external_scope_id: z.string(), external_scope_name: z.string(), repository_key: z.string() }).parse(await c.req.json()); return c.json(await mapConnectorScope(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"), { externalScopeId: input.external_scope_id, externalScopeName: input.external_scope_name, repositoryKey: input.repository_key })); });
   app.post("/v1/admin/connectors/:id/revoke", async (c) => c.json(await revokeConnector(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"))));
+  app.get("/api/admin/memories", async (c) => {
+    const workspaceId = z.string().uuid().parse(c.req.query("workspace_id"));
+    const rows = (await db.query(`
+      SELECT m.id, m.memory_type, m.content, m.repository_id, m.status, m.event_at, m.created_at
+      FROM memories m
+      JOIN workspace_memberships wm ON wm.workspace_id = m.workspace_id
+      WHERE m.workspace_id = $1 AND wm.user_id = $2 AND wm.revoked_at IS NULL
+      ORDER BY m.created_at DESC LIMIT 50
+    `, [workspaceId, c.get("humanUserId")])).rows;
+    return c.json({ memories: rows });
+  });
 
   app.post("/v1/events/batch", async (c) => {
     const principal = c.get("principal");
