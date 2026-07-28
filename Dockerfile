@@ -16,7 +16,6 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY web ./web
 COPY migrations ./migrations
-COPY scripts/set-plan-override.mjs ./scripts/set-plan-override.mjs
 USER node
 EXPOSE 3000
 CMD ["node", "dist/server.js"]
