@@ -9,6 +9,7 @@ import {
 } from "node:crypto";
 import type pg from "pg";
 import { redactValue } from "termyte/security/redaction";
+import { enqueueExtractionJob } from "./worker.js";
 import type { Database } from "./db.js";
 import { transaction } from "./db.js";
 import { ForbiddenError, NotFoundError } from "./errors.js";
@@ -338,6 +339,7 @@ export async function revokeConnector(
 export async function ingestConnectorWebhook(
   db: Database,
   event: NormalizedConnectorEvent,
+  extractionVersion = "v1",
 ) {
   return transaction(db, async (client) => {
     const connection = (await client.query<{
@@ -401,6 +403,7 @@ export async function ingestConnectorWebhook(
       UPDATE connector_connections SET last_synced_at = now(), last_error = NULL, updated_at = now()
       WHERE id = $1
     `, [connection.id]);
+    await enqueueExtractionJob(client, connection.workspace_id, "source_record", sourceId, extractionVersion);
     return { accepted: true, duplicate: false, source_event_id: sourceId };
   });
 }
@@ -642,4 +645,3 @@ async function audit(
     ) VALUES ($1, $2, 'human', $3, $4, $5, $6, $7)
   `, [randomUUID(), workspaceId, userId, action, targetType, targetId, metadata]);
 }
-

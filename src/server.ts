@@ -38,6 +38,7 @@ import { createSupabaseHumanAuthenticator, type HumanAuthenticator } from "./hum
 import { createAgentIdentity, createWorkspace, listAgents, listWorkspaces } from "./admin.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
+import { enqueueExtractionJob } from "./worker.js";
 
 type Variables = { principal: AgentPrincipal; humanUserId: string; requestId: string };
 const SessionIngestSchema = z.object({
@@ -57,6 +58,7 @@ export interface CreateAppOptions {
   publicAppUrl?: string;
   metricsToken?: string;
   connectorRuntime?: ConnectorRuntime;
+  extractionVersion?: string;
 }
 
 export function createApp(db: Database, pepper: string, options: CreateAppOptions = {}) {
@@ -104,7 +106,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     if (provider === "slack" && body.type === "url_verification") return c.json({ challenge: body.challenge });
     const event = normalizeConnectorWebhook(provider, body, c.req.raw.headers);
     if (!event) return c.json({ received: true, ignored: true });
-    return c.json({ received: true, ...(await ingestConnectorWebhook(db, event)) });
+    return c.json({ received: true, ...(await ingestConnectorWebhook(db, event, options.extractionVersion ?? "v1")) });
   });
   app.get("/v1/connectors/oauth/callback", async (c) => {
     if (!options.connectorRuntime) return c.text("Connectors are not configured", 503);
@@ -192,6 +194,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
         completed_at = EXCLUDED.completed_at
       RETURNING id
     `, [id, input.workspace_id, input.external_session_id, input.agent_type, input.repository, input.branch, input.summary_json, input.started_at, input.completed_at])).rows[0];
+    await enqueueExtractionJob(db, input.workspace_id, "agent_session", row!.id, options.extractionVersion ?? "v1");
     return c.json({ session_id: row!.id }, 201);
   });
 
@@ -204,6 +207,6 @@ function error(code: string, message: string, requestId: string) { return { sche
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const config = loadConfig();
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
-  const app = createApp(db, config.AGENT_TOKEN_PEPPER, { publicAppUrl: config.PUBLIC_APP_URL, metricsToken: undefined, connectorRuntime: { encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY ?? ""), webhookSecrets: { github: config.GITHUB_WEBHOOK_SECRET, slack: config.SLACK_SIGNING_SECRET } } });
+  const app = createApp(db, config.AGENT_TOKEN_PEPPER, { publicAppUrl: config.PUBLIC_APP_URL, metricsToken: undefined, extractionVersion: config.EXTRACTION_VERSION, connectorRuntime: { encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY ?? ""), webhookSecrets: { github: config.GITHUB_WEBHOOK_SECRET, slack: config.SLACK_SIGNING_SECRET } } });
   serve({ fetch: app.fetch, port: config.PORT });
 }
