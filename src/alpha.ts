@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "./db.js";
 import type { AgentPrincipal } from "./agent-auth.js";
-import type { AgentEvent, ResolveContextRequest, ResolveContextResponse } from "termyte/protocol";
+import { createHash } from "node:crypto";
+import type { AgentEvent, ResolveContextRequest, ResolveContextResponse, AcknowledgeReceiptRequest } from "termyte/protocol";
 import type { ReportOutcomeRequest } from "termyte/protocol";
 
 export async function storeAlphaEvents(db: Database, principal: AgentPrincipal, events: AgentEvent[]): Promise<{ accepted: string[]; existing: string[] }> {
@@ -84,10 +85,25 @@ export async function resolveAlphaContext(db: Database, principal: AgentPrincipa
     LIMIT $5
   `, [principal.workspaceId, input.repository_key, input.branch ?? null, references, Math.min(20, input.cloud_token_budget / 40)]);
   if (result.rows.length === 0) return { schema_version: 3, state: "abstained", receipt_id: randomUUID(), code: "no_match", message: "No confident context match for this repository and branch." };
-  return {
+  const response: ResolveContextResponse = {
     schema_version: 3, state: "context", receipt_id: randomUUID(), task_mode: input.task_mode_hint ?? "general", omitted_count: 0, expires_at: Date.now() + 300_000,
     items: result.rows.map((row) => ({ item_id: row.id, type: row.record_type === "failure" ? "attempt" : "fact", text: row.content, status: "observed", confidence: row.branch === input.branch && input.branch ? 0.95 : 0.75, task_relevance: 80, company_relevance: 40, task_reason: "Matched repository and session context", company_reason: "Stored source record", source: { source_record_id: row.id, provider: row.provider, title: row.record_type, ...(row.source_url ? { url: row.source_url } : {}), occurred_at: row.event_at.getTime() } })),
   };
+  await db.query(`INSERT INTO alpha_receipts (id, workspace_id, agent_identity_id, packet_json, expires_at) VALUES ($1,$2,$3,$4,to_timestamp($5 / 1000.0))`, [response.receipt_id, principal.workspaceId, principal.agentIdentityId, JSON.stringify(response), response.expires_at]);
+  return response;
+}
+
+export async function acknowledgeAlphaReceipt(db: Database, principal: AgentPrincipal, receiptId: string, input: AcknowledgeReceiptRequest) {
+  const receipt = (await db.query<{ packet_json: ResolveContextResponse; expires_at: Date; delivery_status: string | null }>(`SELECT packet_json, expires_at, delivery_status FROM alpha_receipts WHERE id=$1 AND workspace_id=$2 AND agent_identity_id=$3`, [receiptId, principal.workspaceId, principal.agentIdentityId])).rows[0];
+  if (!receipt) throw new Error("Receipt not found");
+  if (receipt.delivery_status) return { acknowledged: true as const, schema_version: 3 as const };
+  if (receipt.expires_at.getTime() <= Date.now()) throw new Error("Receipt expired");
+  if (input.delivery_status === "delivered") {
+    const hash = createHash("sha256").update(input.final_packet, "utf8").digest("hex");
+    if (hash !== input.final_packet_sha256 || input.final_packet !== JSON.stringify(receipt.packet_json)) throw new Error("Receipt packet hash mismatch");
+  }
+  await db.query(`UPDATE alpha_receipts SET delivery_status=$2, acknowledged_at=now(), idempotency_key=$3 WHERE id=$1 AND delivery_status IS NULL`, [receiptId, input.delivery_status, input.idempotency_key]);
+  return { acknowledged: true as const, schema_version: 3 as const };
 }
 
 export async function storeAlphaOutcome(db: Database, principal: AgentPrincipal, input: ReportOutcomeRequest): Promise<void> {

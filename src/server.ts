@@ -7,6 +7,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import {
   DeviceAuthorizationStartRequestSchema,
+  AcknowledgeReceiptRequestSchema,
   EventBatchRequestSchema,
   ReportOutcomeRequestSchema,
   ResolveContextRequestSchema,
@@ -15,7 +16,7 @@ import {
 } from "termyte/protocol";
 import { redactValue } from "termyte/security/redaction";
 import { z } from "zod";
-import { resolveAlphaContext, storeAlphaEvents, storeAlphaOutcome } from "./alpha.js";
+import { resolveAlphaContext, storeAlphaEvents, storeAlphaOutcome, acknowledgeAlphaReceipt } from "./alpha.js";
 import { authenticateAgent, hasScope, type AgentPrincipal } from "./agent-auth.js";
 import { loadConfig } from "./config.js";
 import { createDatabase, type Database } from "./db.js";
@@ -194,7 +195,11 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     const principal = c.get("principal"); if (!hasScope(principal, "context:read")) return c.json(error("FORBIDDEN", "Credential lacks context:read", c.get("requestId")), 403);
     return c.json(await resolveAlphaContext(db, principal, parseProtocol(ResolveContextRequestSchema, await c.req.json())));
   });
-  app.post("/v1/receipts/:id/ack", async (c) => c.json(error("NOT_FOUND", "Receipt acknowledgement is not part of alpha", c.get("requestId")), 404));
+  app.post("/v1/receipts/:id/ack", async (c) => {
+    const principal = c.get("principal");
+    if (!hasScope(principal, "context:read")) return c.json(error("FORBIDDEN", "Credential lacks context:read", c.get("requestId")), 403);
+    return c.json(await acknowledgeAlphaReceipt(db, principal, c.req.param("id"), parseProtocol(AcknowledgeReceiptRequestSchema, await c.req.json())));
+  });
   app.post("/v1/outcomes", async (c) => {
     const principal = c.get("principal"); if (!hasScope(principal, "outcomes:write")) return c.json(error("FORBIDDEN", "Credential lacks outcomes:write", c.get("requestId")), 403);
     await storeAlphaOutcome(db, principal, parseProtocol(ReportOutcomeRequestSchema, await c.req.json()));

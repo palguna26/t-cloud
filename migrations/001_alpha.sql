@@ -152,6 +152,17 @@ CREATE TABLE alpha_memories (
   event_at timestamptz NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE alpha_receipts (
+  id uuid PRIMARY KEY,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  agent_identity_id uuid NOT NULL REFERENCES agent_identities(id) ON DELETE CASCADE,
+  packet_json jsonb NOT NULL,
+  expires_at timestamptz NOT NULL,
+  delivery_status text CHECK (delivery_status IN ('delivered', 'failed')),
+  acknowledged_at timestamptz,
+  idempotency_key text,
+  UNIQUE (workspace_id, idempotency_key)
+);
 CREATE TABLE alpha_memory_sources (
   memory_id uuid NOT NULL REFERENCES alpha_memories(id) ON DELETE CASCADE,
   source_record_id uuid NOT NULL REFERENCES alpha_source_records(id) ON DELETE CASCADE,
