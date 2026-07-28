@@ -1,7 +1,7 @@
 import { pathToFileURL } from "node:url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { Hono } from "hono";
+import { Hono, type Handler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
@@ -78,7 +78,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     exposeHeaders: ["x-request-id"],
     maxAge: 600,
   }));
-  app.use("/webhooks/connectors/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
+  app.use("/webhooks/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/api/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
 
@@ -94,8 +94,8 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     return c.text(metrics.render({ pending: row.pending, failed: row.failed, dead: row.dead, oldestPendingSeconds: row.oldest_pending_seconds }), 200, { "content-type": "text/plain; version=0.0.4" });
   });
 
-  app.post("/webhooks/connectors/:provider", async (c) => {
-    const provider = c.req.param("provider") as ConnectorProvider;
+  const webhookHandler = (fixedProvider?: ConnectorProvider): Handler<{ Variables: Variables }> => async (c) => {
+    const provider = fixedProvider ?? c.req.param("provider") as ConnectorProvider;
     if (!CONNECTOR_PROVIDERS.includes(provider)) return c.json({ received: false }, 404);
     const secret = options.connectorRuntime?.webhookSecrets[provider];
     if (!secret) return c.json({ received: false }, 503);
@@ -107,7 +107,10 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     const event = normalizeConnectorWebhook(provider, body, c.req.raw.headers);
     if (!event) return c.json({ received: true, ignored: true });
     return c.json({ received: true, ...(await ingestConnectorWebhook(db, event, options.extractionVersion ?? "v1")) });
-  });
+  };
+  app.post("/webhooks/connectors/:provider", webhookHandler());
+  app.post("/webhooks/github", webhookHandler("github"));
+  app.post("/webhooks/slack", webhookHandler("slack"));
   app.get("/v1/connectors/oauth/callback", async (c) => {
     if (!options.connectorRuntime) return c.text("Connectors are not configured", 503);
     const provider = z.enum(CONNECTOR_PROVIDERS).parse(c.req.query("provider"));

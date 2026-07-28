@@ -38,6 +38,7 @@ export interface NormalizedConnectorEvent {
   canonicalUrl?: string;
   externalScopeId?: string;
   repositoryKey?: string;
+  githubReference?: { url: string; repositoryKey: string; kind: "issue" | "pull"; number: string };
   occurredAt: Date;
   providerUpdatedAt?: Date;
   raw: Record<string, unknown>;
@@ -357,7 +358,7 @@ export async function ingestConnectorWebhook(
           WHERE connector_connection_id = $1 AND external_scope_id = $2
         `, [connection.id, event.externalScopeId])).rows[0]?.repository_key
       : undefined;
-    if (event.provider === "slack" && !mappedRepository) {
+    if (event.provider === "slack" && !mappedRepository && !event.repositoryKey) {
       return { accepted: false, duplicate: false, ignored: "scope_not_selected" };
     }
     const scopedEvent = {
@@ -376,28 +377,33 @@ export async function ingestConnectorWebhook(
       .update(`${event.entityKey}\0${event.occurredAt.toISOString()}\0${contentHash}`)
       .digest("hex");
     const duplicate = (await client.query<{ id: string }>(`
-      SELECT id FROM alpha_source_records
-      WHERE workspace_id = $1 AND provider = $2 AND external_id = $3
+      SELECT id FROM source_records
+      WHERE workspace_id = $1 AND source_type = $2 AND external_id = $3
     `, [connection.workspace_id, event.provider, providerEventId])).rows[0];
     if (duplicate) {
       return { accepted: false, duplicate: true, source_event_id: duplicate.id };
     }
     const sourceId = randomUUID();
+    const parentRecordId = event.githubReference
+      ? (await client.query<{ id: string }>(`SELECT id FROM source_records WHERE workspace_id=$1 AND source_type='github' AND source_url=$2 ORDER BY event_at DESC LIMIT 1`, [connection.workspace_id, event.githubReference.url])).rows[0]?.id ?? null
+      : null;
     await client.query(`
-      INSERT INTO alpha_source_records
-        (id, workspace_id, provider, external_id, record_type, repository, content, source_url, event_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      ON CONFLICT (workspace_id, provider, external_id) DO NOTHING
+      INSERT INTO source_records
+        (id, workspace_id, source_type, external_id, repository_id, parent_record_id, record_type, content, source_url, event_at, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (workspace_id, source_type, external_id) DO NOTHING
     `, [
       sourceId,
       connection.workspace_id,
       event.provider,
       providerEventId,
-      event.eventType,
       scopedEvent.repositoryKey ?? null,
+      parentRecordId,
+      event.eventType,
       redacted.value.text,
       event.canonicalUrl ?? null,
       event.occurredAt,
+      { title: scopedEvent.title, provider_updated_at: scopedEvent.providerUpdatedAt?.toISOString(), github_reference: event.githubReference ?? null, raw: redacted.value.raw },
     ]);
     await client.query(`
       UPDATE connector_connections SET last_synced_at = now(), last_error = NULL, updated_at = now()
@@ -526,10 +532,25 @@ export function normalizeConnectorWebhook(
   headers: Headers,
 ): NormalizedConnectorEvent | null {
   if (provider === "github") {
-    const item = body.comment ?? body.review ?? body.issue ?? body.pull_request ?? body.discussion;
     const repository = body.repository;
     const account = body.installation?.id;
-    if (!item?.id || !repository?.full_name || !account) return null;
+    if (!repository?.full_name || !account) return null;
+    if (headers.get("x-github-event") === "push") {
+      const after = String(body.after ?? body.head_commit?.id ?? "");
+      if (!after) return null;
+      const commits = Array.isArray(body.commits) ? body.commits : [];
+      return {
+        provider, externalAccountId: String(account), externalId: `push:${after}`, entityKey: `push:${after}`,
+        providerEventId: headers.get("x-github-delivery") ?? undefined, eventType: "evidence",
+        title: `Push to ${String(body.ref ?? repository.full_name)}`,
+        text: commits.map((commit: Record<string, unknown>) => `${String(commit.id ?? "").slice(0, 12)} ${String(commit.message ?? "")}`.trim()).join("\n") || `Commit ${after}`,
+        canonicalUrl: repository.html_url ? `${repository.html_url}/commit/${after}` : undefined,
+        externalScopeId: String(repository.id), repositoryKey: `github.com/${repository.full_name}`,
+        occurredAt: date(body.head_commit?.timestamp ?? body.repository?.pushed_at), raw: body,
+      };
+    }
+    const item = body.comment ?? body.review ?? body.issue ?? body.pull_request ?? body.discussion;
+    if (!item?.id) return null;
     const action = typeof body.action === "string" ? body.action : "updated";
     const title = item.title ?? body.issue?.title ?? body.pull_request?.title
       ?? `GitHub ${headers.get("x-github-event") ?? "event"}`;
@@ -560,6 +581,7 @@ export function normalizeConnectorWebhook(
     const rootTs = String(event.thread_ts ?? event.ts);
     const entityKey = `${body.team_id}:${envelope.channel}:${rootTs}`;
     const title = String(event.text).split(/\r?\n/, 1)[0]!.trim().slice(0, 120);
+    const githubReference = parseGitHubReference(String(event.text));
     return {
       provider,
       externalAccountId: String(body.team_id),
@@ -570,6 +592,8 @@ export function normalizeConnectorWebhook(
       title,
       text: String(event.text),
       externalScopeId: String(envelope.channel),
+      repositoryKey: githubReference?.repositoryKey,
+      githubReference,
       occurredAt: new Date(Number(event.edited?.ts ?? envelope.event_ts ?? event.ts) * 1_000),
       providerUpdatedAt: event.edited?.ts ? new Date(Number(event.edited.ts) * 1_000) : undefined,
       raw: body,
@@ -596,6 +620,12 @@ export function normalizeConnectorWebhook(
     providerUpdatedAt: date(data.updatedAt ?? body.webhookTimestamp),
     raw: body,
   };
+}
+
+export function parseGitHubReference(text: string): NormalizedConnectorEvent["githubReference"] {
+  const match = text.match(/https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/(issues|pull)\/(\d+)/i);
+  if (!match) return undefined;
+  return { url: match[0], repositoryKey: `github.com/${match[1]}/${match[2]}`, kind: match[3]!.toLowerCase() === "issues" ? "issue" : "pull", number: match[4]! };
 }
 
 function date(value: unknown): Date {

@@ -1,13 +1,21 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { createApp } from "../src/server.js";
 import {
   decryptCredentials,
   encryptCredentials,
   normalizeConnectorWebhook,
   verifyConnectorWebhook,
+  parseGitHubReference,
 } from "../src/connectors.js";
 
 describe("connector security", () => {
+  it("exposes the exact provider webhook aliases", async () => {
+    const app = createApp({ query: async () => ({ rows: [], rowCount: 0 }) } as any, "x".repeat(32), { connectorRuntime: { encryptionKey: Buffer.alloc(32), webhookSecrets: { github: "github-secret", slack: "slack-secret" } } });
+    expect((await app.request("/webhooks/github", { method: "POST", body: "{}" })).status).toBe(401);
+    expect((await app.request("/webhooks/slack", { method: "POST", body: "{}" })).status).toBe(401);
+  });
+
   it("encrypts credentials with authenticated encryption", () => {
     const key = randomBytes(32);
     const encrypted = encryptCredentials(key, {
@@ -59,6 +67,16 @@ describe("connector security", () => {
 });
 
 describe("connector normalization", () => {
+  it("normalizes GitHub pushes and their commits", () => {
+    const event = normalizeConnectorWebhook("github", { installation: { id: 42 }, repository: { id: 7, full_name: "termyte/app", html_url: "https://github.com/termyte/app" }, ref: "refs/heads/main", after: "abc123", head_commit: { timestamp: "2026-07-28T00:00:00Z" }, commits: [{ id: "abc123", message: "Fix auth" }] }, new Headers({ "x-github-event": "push", "x-github-delivery": "push-1" }));
+    expect(event).toMatchObject({ externalId: "push:abc123", providerEventId: "push-1", repositoryKey: "github.com/termyte/app", eventType: "evidence", text: "abc123 Fix auth" });
+  });
+
+  it("extracts GitHub issue and pull references from Slack text", () => {
+    expect(parseGitHubReference("See https://github.com/acme/app/issues/42 today")).toEqual({ url: "https://github.com/acme/app/issues/42", repositoryKey: "github.com/acme/app", kind: "issue", number: "42" });
+    expect(parseGitHubReference("Review https://github.com/acme/app/pull/7.")).toMatchObject({ repositoryKey: "github.com/acme/app", kind: "pull", number: "7" });
+  });
+
   it("normalizes GitHub issues with repository identity", () => {
     const event = normalizeConnectorWebhook("github", {
       action: "opened",
