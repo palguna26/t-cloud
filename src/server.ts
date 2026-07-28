@@ -40,6 +40,16 @@ import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
 
 type Variables = { principal: AgentPrincipal; humanUserId: string; requestId: string };
+const SessionIngestSchema = z.object({
+  workspace_id: z.string().uuid(),
+  repository: z.string().trim().min(1).max(2_000),
+  external_session_id: z.string().trim().min(1).max(200),
+  agent_type: z.enum(["codex", "claude-code"]),
+  branch: z.string().trim().min(1).max(2_000).nullable(),
+  summary_json: z.record(z.string(), z.unknown()),
+  started_at: z.string().datetime({ offset: true }),
+  completed_at: z.string().datetime({ offset: true }),
+}).strict();
 export interface CreateAppOptions {
   authenticateHuman?: HumanAuthenticator;
   demoUserId?: string;
@@ -68,6 +78,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   }));
   app.use("/webhooks/connectors/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
+  app.use("/api/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
 
   app.get("/health", async (c) => { await db.query("SELECT 1"); return c.json({ ok: true }); });
   app.get("/app-config.json", (c) => c.json({ supabase_url: options.webAuth?.supabaseUrl ?? null, supabase_anon_key: options.webAuth?.anonKey ?? null, demo_mode: Boolean(options.demoUserId) }));
@@ -114,6 +125,12 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     if (!principal) return c.json(error("UNAUTHENTICATED", "Invalid agent credential", c.get("requestId")), 401);
     c.set("principal", principal); return next();
   });
+  app.use("/api/v1/*", async (c, next) => {
+    const token = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const principal = await authenticateAgent(db, token, pepper);
+    if (!principal) return c.json(error("UNAUTHENTICATED", "Invalid agent credential", c.get("requestId")), 401);
+    c.set("principal", principal); return next();
+  });
 
   app.post("/v1/device/start", async (c) => {
     if (!await consumeRateLimit(db, `device-start:${c.req.header("x-forwarded-for") ?? "unknown"}`, 20, 600)) return c.json(error("RATE_LIMITED", "Too many requests", c.get("requestId")), 429);
@@ -154,6 +171,28 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     const principal = c.get("principal"); if (!hasScope(principal, "outcomes:write")) return c.json(error("FORBIDDEN", "Credential lacks outcomes:write", c.get("requestId")), 403);
     await storeAlphaOutcome(db, principal, parseProtocol(ReportOutcomeRequestSchema, await c.req.json()));
     return c.json({ schema_version: TERMYTE_PROTOCOL_VERSION, accepted: true }, 201);
+  });
+  app.post("/api/v1/ingest/session", async (c) => {
+    const principal = c.get("principal");
+    if (!hasScope(principal, "events:write")) return c.json(error("FORBIDDEN", "Credential lacks events:write", c.get("requestId")), 403);
+    const input = SessionIngestSchema.parse(await c.req.json());
+    if (input.workspace_id !== principal.workspaceId) return c.json(error("FORBIDDEN", "Workspace mismatch", c.get("requestId")), 403);
+    if (input.agent_type !== principal.platform) return c.json(error("INVALID_ARGUMENT", "Agent type mismatch", c.get("requestId")), 400);
+    const id = crypto.randomUUID();
+    const row = (await db.query<{ id: string }>(`
+      INSERT INTO agent_sessions
+        (id, workspace_id, external_session_id, agent_type, repository_id, branch, summary_json, status, started_at, completed_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'completed', $8, $9)
+      ON CONFLICT (workspace_id, external_session_id) DO UPDATE SET
+        repository_id = EXCLUDED.repository_id,
+        branch = EXCLUDED.branch,
+        summary_json = EXCLUDED.summary_json,
+        status = EXCLUDED.status,
+        started_at = EXCLUDED.started_at,
+        completed_at = EXCLUDED.completed_at
+      RETURNING id
+    `, [id, input.workspace_id, input.external_session_id, input.agent_type, input.repository, input.branch, input.summary_json, input.started_at, input.completed_at])).rows[0];
+    return c.json({ session_id: row!.id }, 201);
   });
 
   app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
