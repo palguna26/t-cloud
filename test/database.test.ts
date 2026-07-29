@@ -42,20 +42,34 @@ suite("alpha PostgreSQL runtime", () => {
     const body = fixture("event-batch-request.json");
     expect((await post("/v1/events/batch", body)).status).toBe(200);
     expect(await (await post("/v1/events/batch", body)).json()).toMatchObject({ accepted_event_ids: [], existing_event_ids: ["event-1"] });
-    expect((await db.query(`SELECT count(*)::int AS count FROM alpha_source_records WHERE workspace_id=$1`, [workspaceId])).rows[0].count).toBe(1);
+    expect((await db.query(`SELECT count(*)::int AS count FROM source_records WHERE workspace_id=$1`, [workspaceId])).rows[0].count).toBe(1);
+  });
+
+  it("keeps the final schema stable across migration reruns", async () => {
+    expect(await migrate(db)).toEqual([]);
+    const tables = (await db.query<{ source_records: string; agent_sessions: string }>(`
+      SELECT to_regclass('source_records')::text AS source_records,
+             to_regclass('agent_sessions')::text AS agent_sessions
+    `)).rows[0];
+    expect(tables).toEqual({ source_records: "source_records", agent_sessions: "agent_sessions" });
+    await db.query(`
+      INSERT INTO source_records
+        (id, workspace_id, source_type, external_id, record_type, repository_id, content, event_at)
+      VALUES ($1, $2, 'linear', 'LIN-1', 'issue', 'github.com/example/alpha', 'Test issue', now())
+    `, [randomUUID(), workspaceId]);
   });
 
   it("returns bounded context or explicit abstention", async () => {
     const body = { ...fixture("resolve-request.json"), repository_key: "github.com/none/repo", agent_session_id: "none", idempotency_key: "none" };
     expect((await (await post("/v1/context/resolve", body)).json()).state).toBe("abstained");
-    await db.query(`INSERT INTO alpha_source_records (id,workspace_id,provider,external_id,record_type,repository,content,event_at) VALUES ($1,$2,'github','issue-1','decision','github.com/none/repo','use the alpha path',now())`, [randomUUID(), workspaceId]);
+    await db.query(`INSERT INTO source_records (id,workspace_id,source_type,external_id,record_type,repository_id,content,event_at) VALUES ($1,$2,'github','issue-1','decision','github.com/none/repo','use the alpha path',now())`, [randomUUID(), workspaceId]);
     expect((await (await post("/v1/context/resolve", body)).json()).state).toBe("context");
   });
 
   it("stores outcomes without Work Thread tables", async () => {
     const body = { ...fixture("outcome-request.json"), agent_session_id: "event-session-1", idempotency_key: "outcome-1" };
     expect((await post("/v1/outcomes", body)).status).toBe(201);
-    expect((await db.query(`SELECT count(*)::int AS count FROM alpha_source_records WHERE workspace_id=$1 AND record_type='outcome'`, [workspaceId])).rows[0].count).toBe(1);
+    expect((await db.query(`SELECT count(*)::int AS count FROM source_records WHERE workspace_id=$1 AND record_type='outcome'`, [workspaceId])).rows[0].count).toBe(1);
   });
 
   it("accepts Codex and Claude Code only", async () => {
@@ -68,7 +82,7 @@ suite("alpha PostgreSQL runtime", () => {
     await db.query(`INSERT INTO connector_connections (id,workspace_id,provider,name,external_account_id,created_by_user_id) VALUES ($1,$2,'slack','Slack test','team-1',$3)`, [connectionId, workspaceId, ownerId]);
     await db.query(`INSERT INTO connector_scope_mappings (id,workspace_id,connector_connection_id,external_scope_id,external_scope_name,repository_key,created_by_user_id) VALUES ($1,$2,$3,'channel-1','bugs','github.com/example/alpha',$4)`, [randomUUID(), workspaceId, connectionId, ownerId]);
     await ingestConnectorWebhook(db, { provider: "slack", externalAccountId: "team-1", externalId: "slack:bug-1", entityKey: "slack:bug-1", providerEventId: "slack-delivery-1", eventType: "observation", title: "Bug discussion", text: "GitHub issue https://github.com/example/alpha/issues/7 is blocked", externalScopeId: "channel-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: {} });
-    await db.query(`INSERT INTO alpha_source_records (id,workspace_id,provider,external_id,record_type,repository,issue_or_pr_reference,content,source_url,event_at) VALUES ($1,$2,'github','issue-7','issue','github.com/example/alpha','7','Fix the blocked auth flow','https://github.com/example/alpha/issues/7',now())`, [randomUUID(), workspaceId]);
+    await db.query(`INSERT INTO source_records (id,workspace_id,source_type,external_id,record_type,repository_id,issue_or_pr_reference,content,source_url,event_at) VALUES ($1,$2,'github','issue-7','issue','github.com/example/alpha','7','Fix the blocked auth flow','https://github.com/example/alpha/issues/7',now())`, [randomUUID(), workspaceId]);
     const body = { ...fixture("resolve-request.json"), repository_key: "github.com/example/alpha", explicit_references: ["https://github.com/example/alpha/issues/7"], agent_session_id: "claude-session", idempotency_key: "briefing-1" };
     const response = await post("/v1/context/resolve", body);
     expect((await response.json()).state).toBe("context");
@@ -95,6 +109,6 @@ suite("alpha PostgreSQL runtime", () => {
     const githubBody = JSON.stringify({ action: "opened", installation: { id: "installation-1" }, repository: { id: 7, full_name: "example/alpha" }, issue: { id: 8, title: "Auth issue", body: "Fix this", html_url: "https://github.com/example/alpha/issues/8", created_at: new Date().toISOString() } });
     const githubSignature = `sha256=${createHmac("sha256", "github-secret").update(githubBody).digest("hex")}`;
     expect((await app.request("/webhooks/connectors/github", { method: "POST", headers: { "content-type": "application/json", "x-hub-signature-256": githubSignature, "x-github-event": "issues", "x-github-delivery": "github-http-1" }, body: githubBody })).status).toBe(200);
-    expect((await db.query(`SELECT count(*)::int AS count FROM alpha_source_records WHERE workspace_id=$1 AND provider IN ('slack','github')`, [workspaceId])).rows[0].count).toBeGreaterThanOrEqual(2);
+    expect((await db.query(`SELECT count(*)::int AS count FROM source_records WHERE workspace_id=$1 AND source_type IN ('slack','github')`, [workspaceId])).rows[0].count).toBeGreaterThanOrEqual(2);
   });
 });
