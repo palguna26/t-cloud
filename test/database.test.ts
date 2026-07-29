@@ -119,6 +119,14 @@ suite("alpha PostgreSQL runtime", () => {
     const second = await (await post("/v1/context/resolve", { ...request, agent_session_id: "golden-session-2", idempotency_key: "LIN-42-context-2" })).json() as { state: string; items: Array<{ type: string; text: string }> };
     expect(second.state).toBe("context");
     expect(second.items).toContainEqual(expect.objectContaining({ type: "outcome", text: "Preserved enterprise SSO expiry and avoided refresh retries." }));
+
+    const dashboard = createApp(db, pepper, { authenticateHuman: async (token) => token === "human" ? { userId: ownerId } : null });
+    const headers = { authorization: "Bearer human" };
+    const listed = await (await dashboard.request(`/v1/admin/work-threads?workspace_id=${workspaceId}`, { headers })).json() as Array<{ id: string; linear_issue_key: string; claim_count: number }>;
+    expect(listed).toContainEqual(expect.objectContaining({ linear_issue_key: "LIN-42", claim_count: 4 }));
+    const detail = await (await dashboard.request(`/v1/admin/work-threads/${linear.work_thread_id}?workspace_id=${workspaceId}`, { headers })).json() as { claims: unknown[]; receipts: unknown[] };
+    expect(detail.claims).toHaveLength(4);
+    expect(detail.receipts).toHaveLength(2);
   });
 
   it("starts device authentication for the two supported agents", async () => {

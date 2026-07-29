@@ -7,7 +7,7 @@ const db = {
 } as never;
 
 describe("hosted web app", () => {
-  it("publishes browser-safe authentication configuration", async () => {
+  it("keeps authentication secrets on the server", async () => {
     const app = createApp(db, "x".repeat(32), {
       webAuth: {
         supabaseUrl: "https://example.supabase.co",
@@ -17,18 +17,18 @@ describe("hosted web app", () => {
     const response = await app.request("/app-config.json");
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      supabase_url: "https://example.supabase.co",
-      supabase_anon_key: "public-anon-key",
+      auth_configured: true,
       demo_mode: false,
+      connectors: [],
     });
   });
 
   it("does not invent auth configuration", async () => {
     const app = createApp(db, "x".repeat(32));
     expect(await (await app.request("/app-config.json")).json()).toEqual({
-      supabase_url: null,
-      supabase_anon_key: null,
+      auth_configured: false,
       demo_mode: false,
+      connectors: [],
     });
   });
 
@@ -39,6 +39,12 @@ describe("hosted web app", () => {
     expect(await (await app.request("/app-config.json")).json()).toMatchObject({
       demo_mode: true,
     });
+    const login = await app.request("/auth/demo", { method: "POST" });
+    expect(login.status).toBe(200);
+    expect(login.headers.get("set-cookie")).toContain("termyte_session=demo");
+    const logout = await app.request("/auth/logout", { method: "POST" });
+    expect(logout.status).toBe(200);
+    expect(logout.headers.get("set-cookie")).toContain("termyte_session=");
   });
 
   it("serves the dashboard and its versioned assets", async () => {
@@ -46,22 +52,55 @@ describe("hosted web app", () => {
     const [page, device, script, styles] = await Promise.all([
       app.request("/"),
       app.request("/device?code=ABCD-2345"),
-      app.request("/assets/app.js?v=2"),
-      app.request("/assets/styles.css?v=2"),
+      app.request("/assets/app.js?v=3"),
+      app.request("/assets/styles.css?v=4"),
     ]);
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain("<title>Termyte</title>");
-    expect(html).toContain('data-view="connections"');
+    expect(html).toContain('data-view="threads"');
     expect(device.status).toBe(200);
     expect(script.status).toBe(200);
     const javascript = await script.text();
-    expect(javascript).toContain("Sources and sessions");
-    expect(javascript).toContain("Connect Slack or GitHub");
+    expect(javascript).toContain("Work Threads");
+    expect(javascript).toContain("Linear defines the task");
+    expect(javascript).not.toContain("access_token");
+    expect(javascript).not.toContain("termyte-session");
     expect(javascript).not.toContain('<option value="custom">');
     expect(javascript).not.toContain('<option value="opencode">');
     expect(styles.status).toBe(200);
     expect(await styles.text()).toContain("[hidden] { display: none !important; }");
+  });
+
+  it("sets an HttpOnly cookie without exposing the Supabase token", async () => {
+    const app = createApp(db, "x".repeat(32), {
+      publicAppUrl: "https://app.termyte.dev",
+      webAuth: {
+        supabaseUrl: "https://example.supabase.co",
+        anonKey: "server-anon-key",
+        fetcher: async () => new Response(JSON.stringify({ access_token: "secret-token", user: { email: "founder@example.com" } }), { status: 200, headers: { "content-type": "application/json" } }),
+      },
+    });
+    const response = await app.request("/auth/login", {
+      method: "POST",
+      headers: { origin: "https://app.termyte.dev", "content-type": "application/json" },
+      body: JSON.stringify({ email: "founder@example.com", password: "long-enough" }),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toContain("termyte_session=secret-token");
+    expect(response.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(response.headers.get("set-cookie")).toContain("Secure");
+    expect(JSON.stringify(await response.json())).not.toContain("secret-token");
+  });
+
+  it("rejects cookie-authenticated mutations from another origin", async () => {
+    const app = createApp(db, "x".repeat(32), { demoUserId: "00000000-0000-4000-8000-000000000001", publicAppUrl: "https://app.termyte.dev" });
+    const response = await app.request("/v1/admin/workspaces", {
+      method: "POST",
+      headers: { cookie: "termyte_session=demo", origin: "https://attacker.example", "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bad", slug: "bad" }),
+    });
+    expect(response.status).toBe(403);
   });
 
   it("rejects unsupported Agent Identity kinds before persistence", async () => {
