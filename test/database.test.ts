@@ -59,6 +59,15 @@ suite("alpha PostgreSQL runtime", () => {
     `, [randomUUID(), workspaceId]);
   });
 
+  it("rebuilds a missing migration ledger from the existing schema", async () => {
+    await db.query(`DELETE FROM schema_migrations`);
+    expect(await migrate(db)).toEqual([]);
+    expect((await db.query(`SELECT name FROM schema_migrations ORDER BY name`)).rows.map((row) => row.name)).toEqual([
+      "001_alpha.sql", "002_target_schema.sql", "003_source_providers.sql",
+      "004_linear_connector.sql", "005_work_threads.sql", "006_connector_tenant_safety.sql",
+    ]);
+  });
+
   it("reconciles old cross-workspace connector duplicates before enforcing uniqueness", async () => {
     const otherWorkspaceId = randomUUID();
     const otherOwnerId = randomUUID();
