@@ -18,4 +18,4 @@ COPY web ./web
 COPY migrations ./migrations
 USER node
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["sh", "-c", "node dist/migrate.js && node dist/server.js"]
