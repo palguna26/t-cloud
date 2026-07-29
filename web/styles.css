@@ -175,7 +175,8 @@ dialog::backdrop { background: rgba(18, 24, 21, .48); backdrop-filter: blur(2px)
   .workspace-picker { margin-bottom: 9px; }
   nav { display: flex; overflow-x: auto; }
   .nav-item { flex: 0 0 auto; }
-  .sidebar-footer { display: none; }
+  .sidebar-footer { display: flex; justify-content: flex-end; margin-top: 8px; padding: 8px 5px 0; }
+  .sidebar-footer span:empty { display: none; }
   .topbar { height: auto; padding: 20px; }
   .content { padding: 18px 14px 40px; }
   .cards, .agent-grid { grid-template-columns: 1fr; }

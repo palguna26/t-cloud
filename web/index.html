@@ -3,86 +3,50 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Keep coding agents aligned with company intent.">
+  <meta name="description" content="Source-linked company context for coding agents.">
   <title>Termyte</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=2">
-  <script type="module" src="/assets/app.js?v=2"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=4">
+  <script type="module" src="/assets/app.js?v=3"></script>
 </head>
 <body>
   <div id="toast" role="status" aria-live="polite"></div>
-
   <main id="auth" class="auth-shell">
     <section class="auth-copy">
-      <a class="brand" href="/" aria-label="Termyte home">
-        <span class="brand-mark">T</span><span>Termyte</span>
-      </a>
+      <a class="brand" href="/" aria-label="Termyte home"><span class="brand-mark">T</span><span>Termyte</span></a>
       <div>
-        <p class="eyebrow">INTENT TO OUTCOME</p>
-        <h1>Your coding agents should know what you mean.</h1>
-        <p class="lede">Termyte gives coding agents the intent behind their work and records the evidence that it was completed.</p>
+        <p class="eyebrow">CONTEXT CONTROL PLANE</p>
+        <h1>Give coding agents the full engineering context.</h1>
+        <p class="lede">Termyte connects Linear, Slack, and GitHub into one source-linked briefing for Codex and Claude Code.</p>
       </div>
-      <div class="prompt-demo">
-        <span>Fresh coding agent</span>
-        <p>“Fix that auth bug.”</p>
-        <small>Termyte finds the exact work and supplies the missing context.</small>
-      </div>
+      <div class="prompt-demo"><span>Fresh coding agent</span><p>"Fix LIN-42."</p><small>Termyte finds the ticket, the Slack constraint, and the failed GitHub attempt.</small></div>
     </section>
     <section class="auth-panel">
       <form id="auth-form" class="auth-card">
-        <div>
-          <p class="eyebrow">WELCOME</p>
-          <h2>Sign in to Termyte</h2>
-          <p class="muted">Use your work email to continue.</p>
-        </div>
+        <div><p class="eyebrow">WELCOME</p><h2>Sign in to Termyte</h2><p class="muted">Use your work email to continue.</p></div>
         <label>Email<input id="email" type="email" autocomplete="email" required placeholder="you@company.com"></label>
         <label>Password<input id="password" type="password" autocomplete="current-password" minlength="8" required placeholder="At least 8 characters"></label>
-        <button class="primary" type="submit">Continue</button>
+        <button id="auth-submit" class="primary" type="submit">Sign in</button>
+        <button id="demo-login" class="secondary" type="button" hidden>Enter demo</button>
         <button id="auth-mode" class="text-button" type="button">Create an account instead</button>
         <p id="auth-note" class="form-note"></p>
       </form>
     </section>
   </main>
-
   <div id="app" class="app-shell" hidden>
     <aside class="sidebar">
-      <a class="brand" href="/" aria-label="Termyte home">
-        <span class="brand-mark">T</span><span>Termyte</span>
-      </a>
-      <label class="workspace-picker">
-        <span>Workspace</span>
-        <select id="workspace-select" aria-label="Current workspace"></select>
-      </label>
+      <a class="brand" href="/" aria-label="Termyte home"><span class="brand-mark">T</span><span>Termyte</span></a>
+      <label class="workspace-picker"><span>Workspace</span><select id="workspace-select" aria-label="Current workspace"></select></label>
       <nav aria-label="Main navigation">
-        <button class="nav-item active" data-view="sources"><span class="nav-icon">S</span>Sources</button>
-        <button class="nav-item" data-view="sessions"><span class="nav-icon">A</span>Agent sessions</button>
+        <button class="nav-item active" data-view="threads"><span class="nav-icon">W</span>Work Threads</button>
         <button class="nav-item" data-view="connections"><span class="nav-icon">C</span>Connections</button>
       </nav>
-      <div class="sidebar-footer">
-        <span id="user-email"></span>
-        <button id="sign-out" class="text-button" type="button">Sign out</button>
-      </div>
+      <div class="sidebar-footer"><span id="user-email"></span><button id="sign-out" class="text-button" type="button">Sign out</button></div>
     </aside>
-
     <section class="main">
-      <header class="topbar">
-        <div>
-          <p id="page-eyebrow" class="eyebrow">WORKSPACE ACTIVITY</p>
-          <h1 id="page-title">Sources and sessions</h1>
-        </div>
-        <div class="topbar-actions">
-          <span id="sync-state" class="sync-state"><i></i>Live</span>
-          <button id="refresh" class="secondary" type="button">Refresh</button>
-        </div>
-      </header>
+      <header class="topbar"><div><p id="page-eyebrow" class="eyebrow">AGENT CONTEXT</p><h1 id="page-title">Work Threads</h1></div><button id="refresh" class="secondary" type="button">Refresh</button></header>
       <div id="content" class="content" aria-live="polite"></div>
     </section>
   </div>
-
-  <dialog id="modal">
-    <div class="modal-card">
-      <header><div><p id="modal-eyebrow" class="eyebrow"></p><h2 id="modal-title"></h2></div><button id="modal-close" class="icon-button" type="button" aria-label="Close">×</button></header>
-      <div id="modal-body"></div>
-    </div>
-  </dialog>
+  <dialog id="modal"><div class="modal-card"><header><div><p id="modal-eyebrow" class="eyebrow"></p><h2 id="modal-title"></h2></div><button id="modal-close" class="icon-button" type="button" aria-label="Close">×</button></header><div id="modal-body"></div></div></dialog>
 </body>
 </html>

@@ -8,7 +8,7 @@ const versioned = { schema_version: z.literal(TERMYTE_PROTOCOL_VERSION) };
 export const AgentPlatformSchema = z.enum(["codex", "claude-code"]);
 export const TaskModeSchema = z.enum(["implement", "investigate", "review", "verify", "continue", "general"]);
 export const TrustStatusSchema = z.enum(["observed", "inferred", "verified", "proposed", "conflicting", "stale"]);
-export const SourceProviderSchema = z.enum(["local", "github", "slack", "agent"]);
+export const SourceProviderSchema = z.enum(["local", "github", "slack", "linear", "agent"]);
 export const DeliveryStatusSchema = z.enum(["delivered", "failed"]);
 export const AbstentionCodeSchema = z.enum(["low_confidence", "no_match", "no_authorized_sources", "no_indexed_sources"]);
 export const AgentEventTypeSchema = z.enum(["session_started", "user_prompt", "observation", "decision", "constraint", "action", "attempt", "failure", "evidence", "status_changed", "outcome", "session_ended"]);
@@ -30,7 +30,7 @@ export const ResolveContextRequestSchema = z.object({
 const ContextItemSchema = z.object({
     item_id: id, type: z.enum(["fact", "decision", "constraint", "requirement", "attempt", "discovery", "open_question", "outcome", "evidence"]),
     text, status: TrustStatusSchema, confidence: z.number().min(0).max(1), task_relevance: z.number().int().min(0).max(100), company_relevance: z.number().int().min(0).max(100),
-    task_reason: shortText, company_reason: shortText, source: z.object({ source_record_id: id, provider: z.enum(["github", "slack", "agent"]), title: shortText, url: z.string().url().optional(), author: shortText.optional(), occurred_at: timestamp }).strict(),
+    task_reason: shortText, company_reason: shortText, source: z.object({ source_record_id: id, provider: z.enum(["github", "slack", "linear", "agent"]), title: shortText, url: z.string().url().optional(), author: shortText.optional(), occurred_at: timestamp }).strict(),
 }).strict();
 export const ResolvedContextResponseSchema = z.object({ ...versioned, state: z.literal("context"), receipt_id: id, task_mode: TaskModeSchema, items: z.array(ContextItemSchema), omitted_count: z.number().int().nonnegative(), expires_at: timestamp }).strict();
 export const AbstainedContextResponseSchema = z.object({ ...versioned, state: z.literal("abstained"), receipt_id: id, code: AbstentionCodeSchema, message: shortText }).strict();

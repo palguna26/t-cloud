@@ -4,6 +4,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono, type Handler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { HTTPException } from "hono/http-exception";
 import {
   DeviceAuthorizationStartRequestSchema,
@@ -36,10 +37,11 @@ import {
 } from "./connectors.js";
 import { approveDeviceAuthorization, exchangeDeviceAuthorization, startDeviceAuthorization } from "./device-auth.js";
 import { createSupabaseHumanAuthenticator, type HumanAuthenticator } from "./human-auth.js";
-import { createAgentIdentity, createWorkspace, listAgents, listWorkspaces } from "./admin.js";
+import { createAgentIdentity, createWorkspace, getWorkThread, listAgents, listWorkspaces, listWorkThreads } from "./admin.js";
+import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
-import { enqueueExtractionJob } from "./worker.js";
+import { enqueueExtractionJob, startWorkerLoop } from "./worker.js";
 
 type Variables = { principal: AgentPrincipal; humanUserId: string; requestId: string };
 const SessionIngestSchema = z.object({
@@ -61,7 +63,7 @@ const ContextRequestSchema = z.object({
 export interface CreateAppOptions {
   authenticateHuman?: HumanAuthenticator;
   demoUserId?: string;
-  webAuth?: { supabaseUrl: string; anonKey: string };
+  webAuth?: { supabaseUrl: string; anonKey: string; fetcher?: typeof fetch };
   publicAppUrl?: string;
   metricsToken?: string;
   connectorRuntime?: ConnectorRuntime;
@@ -88,9 +90,14 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.use("/webhooks/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
   app.use("/api/v1/*", bodyLimit({ maxSize: 2 * 1024 * 1024 }));
+  app.use("/auth/*", bodyLimit({ maxSize: 16 * 1024 }));
 
   app.get("/health", async (c) => { await db.query("SELECT 1"); return c.json({ ok: true }); });
-  app.get("/app-config.json", (c) => c.json({ supabase_url: options.webAuth?.supabaseUrl ?? null, supabase_anon_key: options.webAuth?.anonKey ?? null, demo_mode: Boolean(options.demoUserId) }));
+  app.get("/app-config.json", (c) => c.json({
+    auth_configured: Boolean(options.webAuth),
+    demo_mode: Boolean(options.demoUserId),
+    connectors: CONNECTOR_PROVIDERS.filter((provider) => Boolean(options.connectorRuntime?.[provider])),
+  }));
   app.get("/", serveStatic({ path: "./web/index.html" }));
   app.get("/device", serveStatic({ path: "./web/index.html" }));
   app.get("/connect", serveStatic({ path: "./web/index.html" }));
@@ -99,6 +106,30 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     if (options.metricsToken && c.req.header("authorization") !== `Bearer ${options.metricsToken}`) return c.text("Unauthorized\n", 401);
     const row = (await db.query<{ pending: number; failed: number; dead: number; oldest_pending_seconds: number }>(`SELECT count(*) FILTER (WHERE state='pending')::integer AS pending,count(*) FILTER (WHERE state='failed')::integer AS failed,0::integer AS dead,coalesce(extract(epoch FROM now()-min(created_at) FILTER (WHERE state IN ('pending','failed'))),0)::float8 AS oldest_pending_seconds FROM alpha_sync_jobs`)).rows[0] ?? { pending: 0, failed: 0, dead: 0, oldest_pending_seconds: 0 };
     return c.text(metrics.render({ pending: row.pending, failed: row.failed, dead: row.dead, oldestPendingSeconds: row.oldest_pending_seconds }), 200, { "content-type": "text/plain; version=0.0.4" });
+  });
+
+  app.post("/auth/demo", (c) => {
+    if (!options.demoUserId) return c.json({ error: "Demo mode is disabled" }, 404);
+    setCookie(c, "termyte_session", "demo", sessionCookie(options.publicAppUrl));
+    return c.json({ authenticated: true });
+  });
+  app.post("/auth/logout", (c) => { deleteCookie(c, "termyte_session", { path: "/" }); return c.json({ authenticated: false }); });
+  app.post("/auth/:action", async (c) => {
+    if (!validBrowserOrigin(c.req.header("origin"), options.publicAppUrl, c.req.method)) return c.json({ error: "Invalid request origin" }, 403);
+    const action = z.enum(["login", "register"]).parse(c.req.param("action"));
+    if (!options.webAuth) return c.json({ error: "Authentication is not configured" }, 503);
+    const input = z.object({ email: z.string().email(), password: z.string().min(8) }).parse(await c.req.json());
+    const endpoint = action === "login" ? "/auth/v1/token?grant_type=password" : "/auth/v1/signup";
+    const response = await (options.webAuth.fetcher ?? fetch)(`${options.webAuth.supabaseUrl.replace(/\/+$/, "")}${endpoint}`, {
+      method: "POST",
+      headers: { apikey: options.webAuth.anonKey, "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    const body = await response.json() as { access_token?: string; user?: { email?: string }; msg?: string; error_description?: string };
+    if (!response.ok) return c.json({ error: body.msg ?? body.error_description ?? "Authentication failed" }, 401);
+    if (!body.access_token) return c.json({ pending_confirmation: true });
+    setCookie(c, "termyte_session", body.access_token, sessionCookie(options.publicAppUrl));
+    return c.json({ authenticated: true, email: body.user?.email ?? input.email });
   });
 
   const webhookHandler = (fixedProvider?: ConnectorProvider): Handler<{ Variables: Variables }> => async (c) => {
@@ -118,6 +149,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.post("/webhooks/connectors/:provider", webhookHandler());
   app.post("/webhooks/github", webhookHandler("github"));
   app.post("/webhooks/slack", webhookHandler("slack"));
+  app.post("/webhooks/linear", webhookHandler("linear"));
   app.get("/v1/connectors/oauth/callback", async (c) => {
     if (!options.connectorRuntime) return c.text("Connectors are not configured", 503);
     const provider = z.enum(CONNECTOR_PROVIDERS).parse(c.req.query("provider"));
@@ -127,8 +159,10 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
 
   app.use("/v1/*", async (c, next) => {
     if (["/v1/device/start", "/v1/device/token", "/v1/connectors/oauth/callback"].includes(c.req.path)) return next();
-    const token = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const bearer = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const token = bearer || getCookie(c, "termyte_session") || "";
     if (c.req.path.startsWith("/v1/admin/")) {
+      if (!bearer && !validBrowserOrigin(c.req.header("origin"), options.publicAppUrl, c.req.method)) return c.json(error("FORBIDDEN", "Invalid request origin", c.get("requestId")), 403);
       const human = token === "demo" && options.demoUserId ? { userId: options.demoUserId } : options.authenticateHuman ? await options.authenticateHuman(token) : null;
       if (!human) return c.json(error("UNAUTHENTICATED", "Invalid user session", c.get("requestId")), 401);
       c.set("humanUserId", human.userId); return next();
@@ -144,7 +178,9 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     c.set("principal", principal); return next();
   });
   app.use("/api/admin/*", async (c, next) => {
-    const token = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const bearer = c.req.header("authorization")?.replace(/^Bearer /, "") ?? "";
+    const token = bearer || getCookie(c, "termyte_session") || "";
+    if (!bearer && !validBrowserOrigin(c.req.header("origin"), options.publicAppUrl, c.req.method)) return c.json(error("FORBIDDEN", "Invalid request origin", c.get("requestId")), 403);
     const human = token === "demo" && options.demoUserId ? { userId: options.demoUserId } : options.authenticateHuman ? await options.authenticateHuman(token) : null;
     if (!human) return c.json(error("UNAUTHENTICATED", "Invalid user session", c.get("requestId")), 401);
     c.set("humanUserId", human.userId); return next();
@@ -167,9 +203,16 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.get("/v1/admin/agents", async (c) => c.json(await listAgents(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")))));
   app.post("/v1/admin/agents", async (c) => c.json(await createAgentIdentity(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), z.object({ name: z.string().min(1), kind: z.enum(["codex", "claude-code"]) }).parse(await c.req.json())), 201));
   app.get("/v1/admin/connectors", async (c) => c.json(await listConnectors(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")))));
-  app.post("/v1/admin/connectors/:provider/start", async (c) => c.json(await startConnectorOAuth(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), z.enum(CONNECTOR_PROVIDERS).parse(c.req.param("provider")), [], options.publicAppUrl ?? "http://localhost:3000", options.connectorRuntime!)));
+  app.post("/v1/admin/connectors/:provider/start", async (c) => {
+    if (!options.connectorRuntime) return c.json(error("NOT_CONFIGURED", "Connectors are not configured", c.get("requestId")), 503);
+    const provider = z.enum(CONNECTOR_PROVIDERS).parse(c.req.param("provider"));
+    if (!options.connectorRuntime[provider]) return c.json(error("NOT_CONFIGURED", `${provider} is not configured`, c.get("requestId")), 503);
+    return c.json(await startConnectorOAuth(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), provider, [], options.publicAppUrl ?? "http://localhost:3000", options.connectorRuntime));
+  });
   app.post("/v1/admin/connectors/:id/scopes", async (c) => { const input = z.object({ external_scope_id: z.string(), external_scope_name: z.string(), repository_key: z.string() }).parse(await c.req.json()); return c.json(await mapConnectorScope(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"), { externalScopeId: input.external_scope_id, externalScopeName: input.external_scope_name, repositoryKey: input.repository_key })); });
   app.post("/v1/admin/connectors/:id/revoke", async (c) => c.json(await revokeConnector(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"))));
+  app.get("/v1/admin/work-threads", async (c) => c.json(await listWorkThreads(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")))));
+  app.get("/v1/admin/work-threads/:id", async (c) => c.json(await getWorkThread(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), z.string().uuid().parse(c.req.param("id")))));
   app.get("/api/admin/memories", async (c) => {
     const workspaceId = z.string().uuid().parse(c.req.query("workspace_id"));
     const rows = (await db.query(`
@@ -251,15 +294,53 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     return c.json({ briefing, sources: memories.map((memory) => ({ memory_id: memory.id, memory_type: memory.memory_type, repository: memory.repository_id, status: memory.status, event_at: memory.event_at })) });
   });
 
-  app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
+  app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); if (err instanceof ForbiddenError) return c.json(error("FORBIDDEN", err.message || "Forbidden", c.get("requestId")), 403); if (err instanceof NotFoundError) return c.json(error("NOT_FOUND", err.message || "Not found", c.get("requestId")), 404); if (err instanceof ConflictError) return c.json(error("CONFLICT", err.message || "Conflict", c.get("requestId")), 409); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
   return app;
 }
 
 function error(code: string, message: string, requestId: string) { return { schema_version: TERMYTE_PROTOCOL_VERSION, error: { code, message, request_id: requestId } }; }
 
+function sessionCookie(publicAppUrl = "http://localhost:3000") {
+  return { httpOnly: true, secure: new URL(publicAppUrl).protocol === "https:", sameSite: "Lax" as const, path: "/", maxAge: 60 * 60 };
+}
+
+function validBrowserOrigin(origin: string | undefined, publicAppUrl = "http://localhost:3000", method = "GET") {
+  return method === "GET" || method === "HEAD" || origin === new URL(publicAppUrl).origin;
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const config = loadConfig();
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
-  const app = createApp(db, config.AGENT_TOKEN_PEPPER, { publicAppUrl: config.PUBLIC_APP_URL, metricsToken: undefined, extractionVersion: config.EXTRACTION_VERSION, connectorRuntime: { encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY ?? ""), webhookSecrets: { github: config.GITHUB_WEBHOOK_SECRET, slack: config.SLACK_SIGNING_SECRET } } });
+  const webAuth = config.SUPABASE_URL && config.SUPABASE_ANON_KEY
+    ? { supabaseUrl: config.SUPABASE_URL, anonKey: config.SUPABASE_ANON_KEY }
+    : undefined;
+  const app = createApp(db, config.AGENT_TOKEN_PEPPER, {
+    authenticateHuman: webAuth
+      ? createSupabaseHumanAuthenticator(webAuth.supabaseUrl, webAuth.anonKey)
+      : undefined,
+    webAuth,
+    demoUserId: config.DEMO_USER_ID,
+    publicAppUrl: config.PUBLIC_APP_URL,
+    metricsToken: undefined,
+    extractionVersion: config.EXTRACTION_VERSION,
+    connectorRuntime: config.CONNECTOR_ENCRYPTION_KEY ? {
+      encryptionKey: connectorKey(config.CONNECTOR_ENCRYPTION_KEY ?? ""),
+      ...(config.GITHUB_APP_SLUG ? { github: { appSlug: config.GITHUB_APP_SLUG } } : {}),
+      ...(config.SLACK_CLIENT_ID && config.SLACK_CLIENT_SECRET ? { slack: { clientId: config.SLACK_CLIENT_ID, clientSecret: config.SLACK_CLIENT_SECRET } } : {}),
+      ...(config.LINEAR_CLIENT_ID && config.LINEAR_CLIENT_SECRET ? { linear: { clientId: config.LINEAR_CLIENT_ID, clientSecret: config.LINEAR_CLIENT_SECRET } } : {}),
+      webhookSecrets: {
+        github: config.GITHUB_WEBHOOK_SECRET,
+        slack: config.SLACK_SIGNING_SECRET,
+        linear: config.LINEAR_WEBHOOK_SECRET,
+      },
+    } : undefined,
+  });
   serve({ fetch: app.fetch, port: config.PORT });
+  if (config.OPENROUTER_API_KEY) startWorkerLoop(db, {
+    apiKey: config.OPENROUTER_API_KEY,
+    model: config.OPENROUTER_MODEL,
+    baseUrl: config.OPENROUTER_BASE_URL,
+    timeoutMs: config.OPENROUTER_TIMEOUT_MS,
+    extractionVersion: config.EXTRACTION_VERSION,
+  });
 }

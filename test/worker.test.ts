@@ -1,7 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
-import { MemoryExtractionSchema, runOnce } from "../src/worker.js";
+import { MemoryExtractionSchema, runOnce, startWorkerLoop } from "../src/worker.js";
 
 describe("memory extraction worker", () => {
+  it("stops the in-process polling loop", async () => {
+    const db = { query: vi.fn().mockResolvedValue({ rows: [] }) };
+    const stop = startWorkerLoop(db as never, { model: "test", baseUrl: "https://example.com", timeoutMs: 100, extractionVersion: "test" }, 1);
+    await vi.waitFor(() => expect(db.query).toHaveBeenCalled());
+    stop();
+    const calls = db.query.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(db.query).toHaveBeenCalledTimes(calls);
+  });
   it("strictly rejects unknown memory types and fields", () => {
     expect(() => MemoryExtractionSchema.parse({ memories: [{ memory_type: "guess", content: "x", confidence: 1, status: "active" }] })).toThrow();
     expect(() => MemoryExtractionSchema.parse({ memories: [{ memory_type: "decision", content: "x", confidence: 1, status: "active", invented: true }] })).toThrow();

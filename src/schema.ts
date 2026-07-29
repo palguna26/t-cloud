@@ -1,4 +1,4 @@
-import { check, foreignKey, index, jsonb, pgTable, real, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { check, foreignKey, index, integer, jsonb, pgTable, real, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 export const workspaces = pgTable("workspaces", {
@@ -7,11 +7,21 @@ export const workspaces = pgTable("workspaces", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const connectorConnections = pgTable("connector_connections", {
+  id: uuid().primaryKey(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  provider: text({ enum: ["github", "slack", "linear"] }).notNull(),
+});
+
 export const sourceRecords = pgTable("source_records", {
   id: uuid().primaryKey(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
-  sourceType: text("source_type", { enum: ["slack", "github"] }).notNull(),
+  connectorConnectionId: uuid("connector_connection_id").references(() => connectorConnections.id, { onDelete: "set null" }),
+  sourceType: text("source_type", { enum: ["agent", "slack", "github", "linear"] }).notNull(),
   externalId: text("external_id").notNull(),
+  entityKey: text("entity_key"),
+  providerEventId: text("provider_event_id"),
+  contentHash: text("content_hash"),
   repositoryId: text("repository_id"),
   parentRecordId: uuid("parent_record_id"),
   recordType: text("record_type").notNull(),
@@ -19,13 +29,49 @@ export const sourceRecords = pgTable("source_records", {
   author: text(),
   sourceUrl: text("source_url"),
   eventAt: timestamp("event_at", { withTimezone: true }).notNull(),
+  providerUpdatedAt: timestamp("provider_updated_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
   ingestedAt: timestamp("ingested_at", { withTimezone: true }).notNull().defaultNow(),
   metadata: jsonb().$type<Record<string, unknown>>().notNull().default({}),
 }, (table) => [
   foreignKey({ columns: [table.parentRecordId], foreignColumns: [table.id] }).onDelete("set null"),
   uniqueIndex("source_records_external_id_unique").on(table.workspaceId, table.sourceType, table.externalId),
   index("source_records_lookup").on(table.workspaceId, table.repositoryId, table.eventAt),
+  uniqueIndex("source_records_provider_event_unique").on(table.workspaceId, table.sourceType, table.providerEventId),
+  index("source_records_entity_versions").on(table.workspaceId, table.sourceType, table.entityKey, table.providerUpdatedAt, table.eventAt),
 ]);
+
+export const workThreads = pgTable("work_threads", {
+  id: uuid().primaryKey(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  linearIssueKey: text("linear_issue_key").notNull(),
+  title: text().notNull(),
+  repositoryId: text("repository_id"),
+  status: text({ enum: ["active", "blocked", "completed", "archived"] }).notNull().default("active"),
+  version: integer().notNull().default(1),
+  linkUrls: text("link_urls").array().notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("work_threads_linear_key_unique").on(table.workspaceId, table.linearIssueKey)]);
+
+export const workThreadEvidence = pgTable("work_thread_evidence", {
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  workThreadId: uuid("work_thread_id").notNull().references(() => workThreads.id, { onDelete: "cascade" }),
+  sourceRecordId: uuid("source_record_id").notNull().references(() => sourceRecords.id, { onDelete: "cascade" }),
+  linkReason: text("link_reason", { enum: ["linear_root", "explicit_url", "explicit_key", "agent_outcome", "human"] }).notNull(),
+  linkedAt: timestamp("linked_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("work_thread_evidence_unique").on(table.workThreadId, table.sourceRecordId)]);
+
+export const claims = pgTable("claims", {
+  id: uuid().primaryKey(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  workThreadId: uuid("work_thread_id").notNull().references(() => workThreads.id, { onDelete: "cascade" }),
+  sourceRecordId: uuid("source_record_id").notNull().references(() => sourceRecords.id, { onDelete: "cascade" }),
+  claimType: text("claim_type", { enum: ["requirement", "constraint", "decision", "attempt", "fact", "outcome"] }).notNull(),
+  content: text().notNull(),
+  status: text({ enum: ["active", "conflicting", "resolved", "superseded"] }).notNull().default("active"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("claims_source_type_unique").on(table.workThreadId, table.sourceRecordId, table.claimType)]);
 
 export const agentSessions = pgTable("agent_sessions", {
   id: uuid().primaryKey(),
