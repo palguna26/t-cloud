@@ -38,6 +38,7 @@ import {
 import { approveDeviceAuthorization, exchangeDeviceAuthorization, startDeviceAuthorization } from "./device-auth.js";
 import { createSupabaseHumanAuthenticator, type HumanAuthenticator } from "./human-auth.js";
 import { createAgentIdentity, createWorkspace, getWorkThread, listAgents, listWorkspaces, listWorkThreads } from "./admin.js";
+import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
 import { enqueueExtractionJob } from "./worker.js";
@@ -204,7 +205,9 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.get("/v1/admin/connectors", async (c) => c.json(await listConnectors(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")))));
   app.post("/v1/admin/connectors/:provider/start", async (c) => {
     if (!options.connectorRuntime) return c.json(error("NOT_CONFIGURED", "Connectors are not configured", c.get("requestId")), 503);
-    return c.json(await startConnectorOAuth(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), z.enum(CONNECTOR_PROVIDERS).parse(c.req.param("provider")), [], options.publicAppUrl ?? "http://localhost:3000", options.connectorRuntime));
+    const provider = z.enum(CONNECTOR_PROVIDERS).parse(c.req.param("provider"));
+    if (!options.connectorRuntime[provider]) return c.json(error("NOT_CONFIGURED", `${provider} is not configured`, c.get("requestId")), 503);
+    return c.json(await startConnectorOAuth(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), provider, [], options.publicAppUrl ?? "http://localhost:3000", options.connectorRuntime));
   });
   app.post("/v1/admin/connectors/:id/scopes", async (c) => { const input = z.object({ external_scope_id: z.string(), external_scope_name: z.string(), repository_key: z.string() }).parse(await c.req.json()); return c.json(await mapConnectorScope(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"), { externalScopeId: input.external_scope_id, externalScopeName: input.external_scope_name, repositoryKey: input.repository_key })); });
   app.post("/v1/admin/connectors/:id/revoke", async (c) => c.json(await revokeConnector(db, c.get("humanUserId"), z.string().uuid().parse(c.req.query("workspace_id")), c.req.param("id"))));
@@ -291,7 +294,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
     return c.json({ briefing, sources: memories.map((memory) => ({ memory_id: memory.id, memory_type: memory.memory_type, repository: memory.repository_id, status: memory.status, event_at: memory.event_at })) });
   });
 
-  app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
+  app.onError((err, c) => { if (err instanceof HTTPException) return err.getResponse(); if (err instanceof z.ZodError || err instanceof SyntaxError) return c.json(error("INVALID_ARGUMENT", "Invalid request", c.get("requestId")), 400); if (err instanceof ForbiddenError) return c.json(error("FORBIDDEN", err.message || "Forbidden", c.get("requestId")), 403); if (err instanceof NotFoundError) return c.json(error("NOT_FOUND", err.message || "Not found", c.get("requestId")), 404); if (err instanceof ConflictError) return c.json(error("CONFLICT", err.message || "Conflict", c.get("requestId")), 409); return c.json(error("INTERNAL", "Internal server error", c.get("requestId")), 500); });
   return app;
 }
 

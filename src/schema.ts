@@ -55,6 +55,7 @@ export const workThreads = pgTable("work_threads", {
 }, (table) => [uniqueIndex("work_threads_linear_key_unique").on(table.workspaceId, table.linearIssueKey)]);
 
 export const workThreadEvidence = pgTable("work_thread_evidence", {
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
   workThreadId: uuid("work_thread_id").notNull().references(() => workThreads.id, { onDelete: "cascade" }),
   sourceRecordId: uuid("source_record_id").notNull().references(() => sourceRecords.id, { onDelete: "cascade" }),
   linkReason: text("link_reason", { enum: ["linear_root", "explicit_url", "explicit_key", "agent_outcome", "human"] }).notNull(),

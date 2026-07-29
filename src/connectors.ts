@@ -12,7 +12,7 @@ import { redactValue } from "termyte/security/redaction";
 import { enqueueExtractionJob } from "./worker.js";
 import type { Database } from "./db.js";
 import { transaction } from "./db.js";
-import { ForbiddenError, NotFoundError } from "./errors.js";
+import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 import { linkConnectorEvidence } from "./work-threads.js";
 
 export const CONNECTOR_PROVIDERS = ["github", "slack", "linear"] as const;
@@ -191,7 +191,16 @@ export async function finishConnectorOAuth(
   `, [stateHash(input.state), provider])).rows[0];
   if (!pending) throw new ForbiddenError("Invalid or expired connector authorization");
   const exchanged = await exchangeProvider(provider, input, publicAppUrl, runtime);
-  return transaction(db, async (client) => {
+  try {
+    return await transaction(db, async (client) => {
+    const owner = (await client.query<{ workspace_id: string }>(`
+      SELECT workspace_id FROM connector_connections
+      WHERE provider=$1 AND external_account_id=$2 AND status='active'
+      FOR UPDATE
+    `, [provider, exchanged.externalAccountId])).rows[0];
+    if (owner && owner.workspace_id !== pending.workspace_id) {
+      throw new ConflictError("This provider account is already connected to another workspace");
+    }
     const claimed = await client.query(`
       UPDATE connector_oauth_states
       SET used_at = now()
@@ -231,7 +240,14 @@ export async function finishConnectorOAuth(
       external_account_id: exchanged.externalAccountId,
     });
     return row;
-  });
+    });
+  } catch (error) {
+    if ((error as { code?: string; constraint?: string }).code === "23505"
+      && (error as { constraint?: string }).constraint === "connector_active_account_unique") {
+      throw new ConflictError("This provider account is already connected to another workspace");
+    }
+    throw error;
+  }
 }
 
 async function exchangeProvider(

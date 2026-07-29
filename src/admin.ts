@@ -18,16 +18,21 @@ export async function listWorkspaces(db: Database, userId: string) {
   return (await db.query(`SELECT w.id,w.name,w.slug,m.role,w.created_at FROM workspaces w JOIN workspace_memberships m ON m.workspace_id=w.id WHERE m.user_id=$1 AND m.revoked_at IS NULL ORDER BY w.created_at`, [userId])).rows;
 }
 export async function createAgentIdentity(db: Database, userId: string, workspaceId: string, input: { name: string; kind: "codex" | "claude-code" }) {
+  await requireMember(db, userId, workspaceId);
   return (await db.query(`INSERT INTO agent_identities (id,workspace_id,name,kind,created_by_user_id) VALUES ($1,$2,$3,$4,$5) RETURNING id,name,kind,status,created_at`, [randomUUID(), workspaceId, input.name, input.kind, userId])).rows[0];
 }
-export async function listAgents(db: Database, _userId: string, workspaceId: string) {
+export async function listAgents(db: Database, userId: string, workspaceId: string) {
+  await requireMember(db, userId, workspaceId);
   return (await db.query(`SELECT id,name,kind,status,created_at FROM agent_identities WHERE workspace_id=$1 ORDER BY created_at`, [workspaceId])).rows;
 }
 export async function requireMember(db: Database, userId: string, workspaceId: string) {
   const row = (await db.query(`SELECT 1 FROM workspace_memberships WHERE user_id=$1 AND workspace_id=$2 AND revoked_at IS NULL`, [userId, workspaceId])).rows[0];
   if (!row) throw new NotFoundError("Workspace not found");
 }
-export async function requireAdmin(db: Database, userId: string, workspaceId: string) { return requireMember(db, userId, workspaceId); }
+export async function requireAdmin(db: Database, userId: string, workspaceId: string) {
+  const row = (await db.query(`SELECT 1 FROM workspace_memberships WHERE user_id=$1 AND workspace_id=$2 AND role IN ('owner','admin') AND revoked_at IS NULL`, [userId, workspaceId])).rows[0];
+  if (!row) throw new NotFoundError("Workspace not found");
+}
 export async function issueCredential(_db: Database, _userId: string, _workspaceId: string, _agentIdentityId: string, _pepper: string) { return issueAgentCredential(_pepper); }
 
 export async function listWorkThreads(db: Database, userId: string, workspaceId: string) {

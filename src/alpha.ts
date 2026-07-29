@@ -124,13 +124,17 @@ export async function resolveAlphaContext(db: Database, principal: AgentPrincipa
   const result = await db.query<{
     id: string; provider: "agent" | "slack" | "github" | "linear"; record_type: string; content: string; repository: string | null; branch: string | null; source_url: string | null; event_at: Date;
   }>(`
-    SELECT id, source_type AS provider, record_type, content, repository_id AS repository, branch, source_url, event_at
-    FROM source_records
-    WHERE workspace_id = $1
-      AND ($2::text IS NULL OR repository_id = $2)
-      AND ($3::text IS NULL OR branch = $3)
-      AND ($4::text[] = '{}' OR source_url = ANY($4::text[]) OR content ILIKE ANY (SELECT '%' || value || '%' FROM unnest($4::text[]) value))
-    ORDER BY CASE WHEN branch = $3 AND $3 IS NOT NULL THEN 0 ELSE 1 END, event_at DESC
+    SELECT source.id, source.source_type AS provider, source.record_type, source.content,
+      source.repository_id AS repository, source.branch, source.source_url, source.event_at
+    FROM source_records source
+    LEFT JOIN connector_connections connection ON connection.id=source.connector_connection_id
+    WHERE source.workspace_id = $1
+      AND source.revoked_at IS NULL
+      AND (source.connector_connection_id IS NULL OR connection.status='active')
+      AND ($2::text IS NULL OR source.repository_id = $2)
+      AND ($3::text IS NULL OR source.branch = $3)
+      AND ($4::text[] = '{}' OR source.source_url = ANY($4::text[]) OR source.content ILIKE ANY (SELECT '%' || value || '%' FROM unnest($4::text[]) value))
+    ORDER BY CASE WHEN source.branch = $3 AND $3 IS NOT NULL THEN 0 ELSE 1 END, source.event_at DESC
     LIMIT $5
   `, [principal.workspaceId, input.repository_key, input.branch ?? null, references, Math.min(20, input.cloud_token_budget / 40)]);
   if (result.rows.length === 0) return { schema_version: 3, state: "abstained", receipt_id: randomUUID(), code: "no_match", message: "No confident context match for this repository and branch." };
@@ -163,8 +167,12 @@ export async function storeAlphaOutcome(db: Database, principal: AgentPrincipal,
       FOR UPDATE
     `, [principal.workspaceId, input.agent_session_id])).rows[0];
     if (!session) {
-      session = { id: randomUUID(), repository: "unknown", branch: null };
-      await client.query(`INSERT INTO agent_sessions (id, workspace_id, external_session_id, agent_type, repository_id, status, started_at) VALUES ($1, $2, $3, $4, $5, 'active', now()) ON CONFLICT (workspace_id, external_session_id) DO NOTHING`, [session.id, principal.workspaceId, input.agent_session_id, principal.platform, session.repository]);
+      session = (await client.query<{ id: string; repository: string; branch: string | null }>(`
+        INSERT INTO agent_sessions (id, workspace_id, external_session_id, agent_type, repository_id, status, started_at)
+        VALUES ($1, $2, $3, $4, 'unknown', 'active', now())
+        ON CONFLICT (workspace_id, external_session_id) DO UPDATE SET external_session_id=excluded.external_session_id
+        RETURNING id, repository_id AS repository, branch
+      `, [randomUUID(), principal.workspaceId, input.agent_session_id, principal.platform])).rows[0]!;
     }
     if (session) {
       await client.query(`UPDATE agent_sessions SET completed_at = to_timestamp($2 / 1000.0), status = $3::text, summary_json = jsonb_build_object('work_performed', jsonb_build_array($4::text), 'decisions', '[]'::jsonb, 'changes', '[]'::jsonb, 'problems', '[]'::jsonb, 'failed_attempts', '[]'::jsonb, 'current_status', $3::text, 'unfinished_work', '[]'::jsonb, 'next_steps', '[]'::jsonb, 'references', '[]'::jsonb) WHERE id = $1`, [session.id, input.reported_at, input.status, input.summary]);

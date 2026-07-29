@@ -5,7 +5,7 @@ import { issueAgentCredential } from "../src/agent-auth.js";
 import { createDatabase, type Database } from "../src/db.js";
 import { migrate } from "../src/migrate.js";
 import { createApp } from "../src/server.js";
-import { ingestConnectorWebhook } from "../src/connectors.js";
+import { finishConnectorOAuth, ingestConnectorWebhook, startConnectorOAuth } from "../src/connectors.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const suite = databaseUrl ? describe : describe.skip;
@@ -59,11 +59,69 @@ suite("alpha PostgreSQL runtime", () => {
     `, [randomUUID(), workspaceId]);
   });
 
+  it("reconciles old cross-workspace connector duplicates before enforcing uniqueness", async () => {
+    const otherWorkspaceId = randomUUID();
+    const otherOwnerId = randomUUID();
+    await db.query(`INSERT INTO workspaces (id,name,slug,owner_user_id) VALUES ($1,'Migration duplicate',$2,$3)`, [otherWorkspaceId, `migration-${otherWorkspaceId}`, otherOwnerId]);
+    await db.query(`DROP INDEX connector_active_account_unique`);
+    try {
+      await db.query(`INSERT INTO connector_connections (id,workspace_id,provider,name,external_account_id,credentials_ciphertext,created_by_user_id,created_at) VALUES ($1,$2,'github','Older','migration-duplicate',$3,$4,now()-interval '1 minute'),($5,$6,'github','Newer','migration-duplicate',$3,$7,now())`, [randomUUID(), workspaceId, Buffer.from("secret"), ownerId, randomUUID(), otherWorkspaceId, otherOwnerId]);
+      const migration = readFileSync(new URL("../migrations/006_connector_tenant_safety.sql", import.meta.url), "utf8").replace("BEGIN;", "").split("ALTER TABLE source_records")[0]!;
+      await db.query(migration);
+      const statuses = (await db.query<{ status: string }>(`SELECT status FROM connector_connections WHERE provider='github' AND external_account_id='migration-duplicate' ORDER BY created_at`)).rows;
+      expect(statuses.map((row) => row.status)).toEqual(["active", "revoked"]);
+      expect((await db.query(`SELECT credentials_ciphertext FROM connector_connections WHERE provider='github' AND external_account_id='migration-duplicate' AND status='revoked'`)).rows[0].credentials_ciphertext).toBeNull();
+    } finally {
+      await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS connector_active_account_unique ON connector_connections (provider, external_account_id) WHERE status='active'`);
+      await db.query(`DELETE FROM workspaces WHERE id=$1`, [otherWorkspaceId]);
+      await db.query(`DELETE FROM connector_connections WHERE external_account_id='migration-duplicate'`);
+    }
+  });
+
+  it("returns a conflict when two workspaces connect the same provider account concurrently", async () => {
+    const otherWorkspaceId = randomUUID();
+    const otherOwnerId = randomUUID();
+    await db.query(`INSERT INTO workspaces (id,name,slug,owner_user_id) VALUES ($1,'OAuth race',$2,$3)`, [otherWorkspaceId, `oauth-${otherWorkspaceId}`, otherOwnerId]);
+    await db.query(`INSERT INTO workspace_memberships (workspace_id,user_id,role) VALUES ($1,$2,'owner')`, [otherWorkspaceId, otherOwnerId]);
+    const runtime = { encryptionKey: Buffer.alloc(32), webhookSecrets: {}, github: { appSlug: "termyte-test" } };
+    const first = await startConnectorOAuth(db, ownerId, workspaceId, "github", [], "http://localhost:3000", runtime);
+    const second = await startConnectorOAuth(db, otherOwnerId, otherWorkspaceId, "github", [], "http://localhost:3000", runtime);
+    const state = (url: string) => new URL(url).searchParams.get("state")!;
+    const results = await Promise.allSettled([
+      finishConnectorOAuth(db, "github", { state: state(first.authorization_url), installationId: "race-installation" }, "http://localhost:3000", runtime),
+      finishConnectorOAuth(db, "github", { state: state(second.authorization_url), installationId: "race-installation" }, "http://localhost:3000", runtime),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected" && result.reason?.message.includes("already connected"))).toBeTruthy();
+    await db.query(`DELETE FROM workspaces WHERE id=$1`, [otherWorkspaceId]);
+    await db.query(`DELETE FROM connector_connections WHERE external_account_id='race-installation'`);
+  });
+
   it("returns bounded context or explicit abstention", async () => {
     const body = { ...fixture("resolve-request.json"), repository_key: "github.com/none/repo", agent_session_id: "none", idempotency_key: "none" };
     expect((await (await post("/v1/context/resolve", body)).json()).state).toBe("abstained");
     await db.query(`INSERT INTO source_records (id,workspace_id,source_type,external_id,record_type,repository_id,content,event_at) VALUES ($1,$2,'github','issue-1','decision','github.com/none/repo','use the alpha path',now())`, [randomUUID(), workspaceId]);
     expect((await (await post("/v1/context/resolve", body)).json()).state).toBe("context");
+  });
+
+  it("does not return context from revoked connectors", async () => {
+    const connectionId = randomUUID();
+    await db.query(`INSERT INTO connector_connections (id,workspace_id,provider,name,external_account_id,status,created_by_user_id) VALUES ($1,$2,'github','Revoked','revoked-test','revoked',$3)`, [connectionId, workspaceId, ownerId]);
+    await db.query(`INSERT INTO source_records (id,workspace_id,connector_connection_id,source_type,external_id,record_type,repository_id,content,event_at) VALUES ($1,$2,$3,'github','revoked-record','decision','github.com/example/revoked','must stay hidden',now())`, [randomUUID(), workspaceId, connectionId]);
+    const body = { ...fixture("resolve-request.json"), repository_key: "github.com/example/revoked", agent_session_id: "revoked", idempotency_key: "revoked" };
+    expect((await (await post("/v1/context/resolve", body)).json()).state).toBe("abstained");
+  });
+
+  it("does not expose agent administration across workspaces", async () => {
+    const otherWorkspaceId = randomUUID();
+    const otherOwnerId = randomUUID();
+    await db.query(`INSERT INTO workspaces (id,name,slug,owner_user_id) VALUES ($1,'Other',$2,$3)`, [otherWorkspaceId, `other-${otherWorkspaceId}`, otherOwnerId]);
+    await db.query(`INSERT INTO workspace_memberships (workspace_id,user_id,role) VALUES ($1,$2,'owner')`, [otherWorkspaceId, otherOwnerId]);
+    const app = createApp(db, pepper, { authenticateHuman: async () => ({ userId: ownerId }) });
+    expect((await app.request(`/v1/admin/agents?workspace_id=${otherWorkspaceId}`, { headers: { authorization: "Bearer human" } })).status).toBe(404);
+    expect((await app.request(`/v1/admin/agents?workspace_id=${otherWorkspaceId}`, { method: "POST", headers: { authorization: "Bearer human", "content-type": "application/json" }, body: JSON.stringify({ name: "Cross tenant", kind: "codex" }) })).status).toBe(404);
+    expect((await db.query(`SELECT count(*)::int AS count FROM agent_identities WHERE workspace_id=$1`, [otherWorkspaceId])).rows[0].count).toBe(0);
+    await db.query(`DELETE FROM workspaces WHERE id=$1`, [otherWorkspaceId]);
   });
 
   it("stores outcomes without Work Thread tables", async () => {
@@ -96,7 +154,7 @@ suite("alpha PostgreSQL runtime", () => {
     await db.query(`INSERT INTO connector_scope_mappings (id,workspace_id,connector_connection_id,external_scope_id,external_scope_name,repository_key,created_by_user_id) VALUES ($1,$2,$3,'linear-team-1','Engineering','github.com/example/alpha',$4),($5,$2,$6,'slack-channel-2','auth','github.com/example/alpha',$4)`, [randomUUID(), workspaceId, linearConnection, ownerId, randomUUID(), slackConnection]);
     await ingestConnectorWebhook(db, { provider: "slack", externalAccountId: "slack-team-2", externalId: "slack:LIN-42", entityKey: "slack:LIN-42", providerEventId: "slack-LIN-42-v1", eventType: "constraint", title: "SSO constraint", text: "LIN-42 enterprise SSO sessions must not be extended automatically", externalScopeId: "slack-channel-2", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: {} });
     await ingestConnectorWebhook(db, { provider: "github", externalAccountId: "github-install-2", externalId: "github:LIN-42", entityKey: "github:LIN-42", providerEventId: "github-LIN-42-v1", eventType: "failure", title: "Reverted refresh retry", text: "LIN-42 retrying refresh requests created duplicate sessions", canonicalUrl: "https://github.com/example/alpha/pull/42", externalScopeId: "repo-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: {} });
-    const linear = await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-v1", eventType: "decision", title: "Fix token refresh logout", text: "LIN-42 Fix users being logged out during token refresh", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: { identifier: "LIN-42" } });
+    const linear = await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-v1", eventType: "decision", title: "Fix token refresh logout", text: "LIN-42 Fix users being logged out during token refresh", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), providerUpdatedAt: new Date("2026-07-28T10:00:00Z"), raw: { identifier: "LIN-42" } });
     expect(linear.work_thread_id).toBeTruthy();
     const thread = (await db.query<{ source_count: number; claim_types: string[] }>(`
       SELECT count(DISTINCT evidence.source_record_id)::int AS source_count,
@@ -114,6 +172,14 @@ suite("alpha PostgreSQL runtime", () => {
     expect(first.state).toBe("context");
     expect(first.items.map((item) => item.source.provider).sort()).toEqual(["github", "linear", "slack"]);
 
+    await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-v2", eventType: "decision", title: "Fix token refresh logout", text: "LIN-42 Keep SSO expiry while fixing refresh logout", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), providerUpdatedAt: new Date("2026-07-29T10:00:00Z"), raw: { identifier: "LIN-42" } });
+    await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-stale", eventType: "decision", title: "Old token refresh scope", text: "LIN-42 stale requirement", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), providerUpdatedAt: new Date("2026-07-27T10:00:00Z"), raw: { identifier: "LIN-42" } });
+    await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-v1.5", eventType: "decision", title: "Equal-time stale title", text: "LIN-42 equal-time stale requirement", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), providerUpdatedAt: new Date("2026-07-29T10:00:00Z"), raw: { identifier: "LIN-42" } });
+    const linearClaims = (await db.query<{ status: string; content: string }>(`SELECT claim.status,claim.content FROM claims claim JOIN source_records source ON source.id=claim.source_record_id WHERE claim.work_thread_id=$1 AND source.source_type='linear' ORDER BY claim.created_at`, [linear.work_thread_id])).rows;
+    expect(linearClaims.map((claim) => claim.status).sort()).toEqual(["active", "superseded", "superseded", "superseded"]);
+    expect(linearClaims.find((claim) => claim.status === "active")?.content).toBe("LIN-42 Keep SSO expiry while fixing refresh logout");
+    expect((await db.query<{ title: string }>(`SELECT title FROM work_threads WHERE id=$1`, [linear.work_thread_id])).rows[0]!.title).toBe("Fix token refresh logout");
+
     const outcome = { ...fixture("outcome-request.json"), agent_session_id: "golden-session", receipt_id: first.receipt_id, summary: "Preserved enterprise SSO expiry and avoided refresh retries.", idempotency_key: "LIN-42-outcome-1" };
     expect((await post("/v1/outcomes", outcome)).status).toBe(201);
     const second = await (await post("/v1/context/resolve", { ...request, agent_session_id: "golden-session-2", idempotency_key: "LIN-42-context-2" })).json() as { state: string; items: Array<{ type: string; text: string }> };
@@ -123,9 +189,9 @@ suite("alpha PostgreSQL runtime", () => {
     const dashboard = createApp(db, pepper, { authenticateHuman: async (token) => token === "human" ? { userId: ownerId } : null });
     const headers = { authorization: "Bearer human" };
     const listed = await (await dashboard.request(`/v1/admin/work-threads?workspace_id=${workspaceId}`, { headers })).json() as Array<{ id: string; linear_issue_key: string; claim_count: number }>;
-    expect(listed).toContainEqual(expect.objectContaining({ linear_issue_key: "LIN-42", claim_count: 4 }));
+    expect(listed).toContainEqual(expect.objectContaining({ linear_issue_key: "LIN-42", claim_count: 7 }));
     const detail = await (await dashboard.request(`/v1/admin/work-threads/${linear.work_thread_id}?workspace_id=${workspaceId}`, { headers })).json() as { claims: unknown[]; receipts: unknown[] };
-    expect(detail.claims).toHaveLength(4);
+    expect(detail.claims).toHaveLength(7);
     expect(detail.receipts).toHaveLength(2);
   });
 
