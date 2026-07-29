@@ -20,6 +20,9 @@ const ConfigSchema = z.object({
   SLACK_CLIENT_ID: z.string().min(1).optional(),
   SLACK_CLIENT_SECRET: z.string().min(1).optional(),
   SLACK_SIGNING_SECRET: z.string().min(16).optional(),
+  LINEAR_CLIENT_ID: z.string().min(1).optional(),
+  LINEAR_CLIENT_SECRET: z.string().min(1).optional(),
+  LINEAR_WEBHOOK_SECRET: z.string().min(16).optional(),
 });
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env) {

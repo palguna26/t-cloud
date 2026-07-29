@@ -88,6 +88,39 @@ suite("alpha PostgreSQL runtime", () => {
     expect((await response.json()).state).toBe("context");
   });
 
+  it("creates one Linear-keyed Work Thread from explicit cross-source references", async () => {
+    const linearConnection = randomUUID();
+    const slackConnection = randomUUID();
+    const githubConnection = randomUUID();
+    await db.query(`INSERT INTO connector_connections (id,workspace_id,provider,name,external_account_id,created_by_user_id) VALUES ($1,$2,'linear','Linear test','linear-org-1',$3),($4,$2,'slack','Slack test 2','slack-team-2',$3),($5,$2,'github','GitHub test 2','github-install-2',$3)`, [linearConnection, workspaceId, ownerId, slackConnection, githubConnection]);
+    await db.query(`INSERT INTO connector_scope_mappings (id,workspace_id,connector_connection_id,external_scope_id,external_scope_name,repository_key,created_by_user_id) VALUES ($1,$2,$3,'linear-team-1','Engineering','github.com/example/alpha',$4),($5,$2,$6,'slack-channel-2','auth','github.com/example/alpha',$4)`, [randomUUID(), workspaceId, linearConnection, ownerId, randomUUID(), slackConnection]);
+    await ingestConnectorWebhook(db, { provider: "slack", externalAccountId: "slack-team-2", externalId: "slack:LIN-42", entityKey: "slack:LIN-42", providerEventId: "slack-LIN-42-v1", eventType: "constraint", title: "SSO constraint", text: "LIN-42 enterprise SSO sessions must not be extended automatically", externalScopeId: "slack-channel-2", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: {} });
+    await ingestConnectorWebhook(db, { provider: "github", externalAccountId: "github-install-2", externalId: "github:LIN-42", entityKey: "github:LIN-42", providerEventId: "github-LIN-42-v1", eventType: "failure", title: "Reverted refresh retry", text: "LIN-42 retrying refresh requests created duplicate sessions", canonicalUrl: "https://github.com/example/alpha/pull/42", externalScopeId: "repo-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: {} });
+    const linear = await ingestConnectorWebhook(db, { provider: "linear", externalAccountId: "linear-org-1", externalId: "Issue:LIN-42", entityKey: "Issue:LIN-42", providerEventId: "linear-LIN-42-v1", eventType: "decision", title: "Fix token refresh logout", text: "LIN-42 Fix users being logged out during token refresh", canonicalUrl: "https://linear.app/acme/issue/LIN-42/fix-refresh", externalScopeId: "linear-team-1", repositoryKey: "github.com/example/alpha", occurredAt: new Date(), raw: { identifier: "LIN-42" } });
+    expect(linear.work_thread_id).toBeTruthy();
+    const thread = (await db.query<{ source_count: number; claim_types: string[] }>(`
+      SELECT count(DISTINCT evidence.source_record_id)::int AS source_count,
+             array_agg(DISTINCT claims.claim_type ORDER BY claims.claim_type) AS claim_types
+      FROM work_threads thread
+      JOIN work_thread_evidence evidence ON evidence.work_thread_id=thread.id
+      JOIN claims ON claims.work_thread_id=thread.id
+      WHERE thread.workspace_id=$1 AND thread.linear_issue_key='LIN-42'
+    `, [workspaceId])).rows[0];
+    expect(thread.source_count).toBe(3);
+    expect(thread.claim_types).toEqual(["attempt", "constraint", "requirement"]);
+
+    const request = { ...fixture("resolve-request.json"), request_text: "Implement LIN-42", repository_key: "github.com/example/alpha", explicit_references: ["LIN-42"], agent_session_id: "golden-session", idempotency_key: "LIN-42-context-1" };
+    const first = await (await post("/v1/context/resolve", request)).json() as { state: string; receipt_id: string; items: Array<{ source: { provider: string } }> };
+    expect(first.state).toBe("context");
+    expect(first.items.map((item) => item.source.provider).sort()).toEqual(["github", "linear", "slack"]);
+
+    const outcome = { ...fixture("outcome-request.json"), agent_session_id: "golden-session", receipt_id: first.receipt_id, summary: "Preserved enterprise SSO expiry and avoided refresh retries.", idempotency_key: "LIN-42-outcome-1" };
+    expect((await post("/v1/outcomes", outcome)).status).toBe(201);
+    const second = await (await post("/v1/context/resolve", { ...request, agent_session_id: "golden-session-2", idempotency_key: "LIN-42-context-2" })).json() as { state: string; items: Array<{ type: string; text: string }> };
+    expect(second.state).toBe("context");
+    expect(second.items).toContainEqual(expect.objectContaining({ type: "outcome", text: "Preserved enterprise SSO expiry and avoided refresh retries." }));
+  });
+
   it("starts device authentication for the two supported agents", async () => {
     const response = await createApp(db, pepper, { authenticateHuman: async (value) => value === "human" ? { userId: ownerId } : null }).request("/v1/device/start", {
       method: "POST",

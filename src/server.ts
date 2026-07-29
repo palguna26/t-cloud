@@ -118,6 +118,7 @@ export function createApp(db: Database, pepper: string, options: CreateAppOption
   app.post("/webhooks/connectors/:provider", webhookHandler());
   app.post("/webhooks/github", webhookHandler("github"));
   app.post("/webhooks/slack", webhookHandler("slack"));
+  app.post("/webhooks/linear", webhookHandler("linear"));
   app.get("/v1/connectors/oauth/callback", async (c) => {
     if (!options.connectorRuntime) return c.text("Connectors are not configured", 503);
     const provider = z.enum(CONNECTOR_PROVIDERS).parse(c.req.query("provider"));

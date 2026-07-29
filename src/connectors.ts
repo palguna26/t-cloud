@@ -13,14 +13,16 @@ import { enqueueExtractionJob } from "./worker.js";
 import type { Database } from "./db.js";
 import { transaction } from "./db.js";
 import { ForbiddenError, NotFoundError } from "./errors.js";
+import { linkConnectorEvidence } from "./work-threads.js";
 
-export const CONNECTOR_PROVIDERS = ["github", "slack"] as const;
+export const CONNECTOR_PROVIDERS = ["github", "slack", "linear"] as const;
 export type ConnectorProvider = typeof CONNECTOR_PROVIDERS[number];
 
 export interface ConnectorRuntime {
   encryptionKey: Buffer;
   github?: { appSlug: string };
   slack?: { clientId: string; clientSecret: string };
+  linear?: { clientId: string; clientSecret: string };
   synthesis?: unknown;
   webhookSecrets: Partial<Record<ConnectorProvider, string>>;
   fetch?: typeof fetch;
@@ -99,7 +101,22 @@ export function verifyConnectorWebhook(
       `v0=${createHmac("sha256", secret).update(`v0:${timestamp}:${rawBody}`).digest("hex")}`,
     );
   }
+  if (provider === "linear") {
+    const timestamp = webhookTimestamp(rawBody);
+    if (timestamp === null || Math.abs(now - timestamp) > 60_000) return false;
+    return matchesMac(
+      headers.get("linear-signature"),
+      createHmac("sha256", secret).update(rawBody).digest("hex"),
+    );
+  }
   return false;
+}
+
+function webhookTimestamp(rawBody: string): number | null {
+  try {
+    const value = JSON.parse(rawBody) as { webhookTimestamp?: unknown };
+    return typeof value.webhookTimestamp === "number" ? value.webhookTimestamp : null;
+  } catch { return null; }
 }
 
 function matchesMac(received: string | null, expected: string): boolean {
@@ -143,6 +160,15 @@ export async function startConnectorOAuth(
     );
     authorizationUrl.searchParams.set("redirect_uri", callback);
     authorizationUrl.searchParams.set("state", state);
+  } else if (provider === "linear") {
+    if (!runtime.linear) throw new Error("Linear OAuth is not configured");
+    authorizationUrl = new URL("https://linear.app/oauth/authorize");
+    authorizationUrl.searchParams.set("client_id", runtime.linear.clientId);
+    authorizationUrl.searchParams.set("redirect_uri", callback);
+    authorizationUrl.searchParams.set("response_type", "code");
+    authorizationUrl.searchParams.set("scope", "read");
+    authorizationUrl.searchParams.set("state", state);
+    authorizationUrl.searchParams.set("prompt", "consent");
   } else throw new Error(`Unsupported connector provider: ${provider}`);
   return { authorization_url: authorizationUrl.toString() };
 }
@@ -252,6 +278,49 @@ async function exchangeProvider(
       externalAccountId: value.team.id,
       name: value.team.name ?? `Slack ${value.team.id}`,
       credentials: { access_token: value.access_token },
+    };
+  }
+  if (provider === "linear") {
+    if (!runtime.linear) throw new Error("Linear OAuth is not configured");
+    const response = await request("https://api.linear.app/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: runtime.linear.clientId,
+        client_secret: runtime.linear.clientSecret,
+        code: input.code,
+        redirect_uri: callback,
+        grant_type: "authorization_code",
+      }),
+    });
+    const value = await response.json() as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+      error?: string;
+      error_description?: string;
+    };
+    if (!response.ok || !value.access_token) {
+      throw new Error(`Linear OAuth failed: ${value.error_description ?? value.error ?? response.status}`);
+    }
+    const identityResponse = await request("https://api.linear.app/graphql", {
+      method: "POST",
+      headers: { authorization: `Bearer ${value.access_token}`, "content-type": "application/json" },
+      body: JSON.stringify({ query: "query TermyteOrganization { organization { id name } }" }),
+    });
+    const identity = await identityResponse.json() as { data?: { organization?: { id?: string; name?: string } }; errors?: Array<{ message?: string }> };
+    const organization = identity.data?.organization;
+    if (!identityResponse.ok || !organization?.id) {
+      throw new Error(`Linear workspace lookup failed: ${identity.errors?.[0]?.message ?? identityResponse.status}`);
+    }
+    return {
+      externalAccountId: organization.id,
+      name: organization.name ?? `Linear ${organization.id}`,
+      credentials: {
+        access_token: value.access_token,
+        refresh_token: value.refresh_token,
+        expires_in: value.expires_in,
+      },
     };
   }
   throw new Error(`Unsupported connector provider: ${provider}`);
@@ -389,28 +458,35 @@ export async function ingestConnectorWebhook(
       : null;
     await client.query(`
       INSERT INTO source_records
-        (id, workspace_id, source_type, external_id, repository_id, parent_record_id, record_type, content, source_url, event_at, metadata)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        (id, workspace_id, connector_connection_id, source_type, external_id, entity_key, provider_event_id, content_hash,
+         repository_id, parent_record_id, record_type, content, source_url, event_at, provider_updated_at, metadata)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       ON CONFLICT (workspace_id, source_type, external_id) DO NOTHING
     `, [
       sourceId,
       connection.workspace_id,
+      connection.id,
       event.provider,
       providerEventId,
+      event.entityKey,
+      providerEventId,
+      contentHash,
       scopedEvent.repositoryKey ?? null,
       parentRecordId,
       event.eventType,
       redacted.value.text,
       event.canonicalUrl ?? null,
       event.occurredAt,
+      event.providerUpdatedAt ?? null,
       { title: scopedEvent.title, provider_updated_at: scopedEvent.providerUpdatedAt?.toISOString(), github_reference: event.githubReference ?? null, raw: redacted.value.raw },
     ]);
     await client.query(`
       UPDATE connector_connections SET last_synced_at = now(), last_error = NULL, updated_at = now()
       WHERE id = $1
     `, [connection.id]);
+    const workThreadId = await linkConnectorEvidence(client, connection.workspace_id, sourceId, scopedEvent, String(redacted.value.text));
     await enqueueExtractionJob(client, connection.workspace_id, "source_record", sourceId, extractionVersion);
-    return { accepted: true, duplicate: false, source_event_id: sourceId };
+    return { accepted: true, duplicate: false, source_event_id: sourceId, work_thread_id: workThreadId };
   });
 }
 
@@ -603,17 +679,18 @@ export function normalizeConnectorWebhook(
   const organizationId = body.organizationId ?? body.organization?.id;
   if (!organizationId || !data?.id) return null;
   const type = String(body.type ?? "event");
-  const entityKey = `${type}:${data.id}`;
+  const stableId = type === "Issue" && data.identifier ? String(data.identifier) : String(data.id);
+  const entityKey = `${type}:${stableId}`;
   const title = String(data.title ?? data.body?.slice?.(0, 120) ?? `${type} update`);
   return {
     provider,
     externalAccountId: String(organizationId),
     externalId: entityKey,
     entityKey,
-    providerEventId: String(body.webhookId ?? body.webhook_id ?? "") || undefined,
+    providerEventId: headers.get("linear-delivery") ?? (String(body.webhookId ?? body.webhook_id ?? "") || undefined),
     eventType: type === "Comment" ? "observation" : "decision",
     title,
-    text: String(data.description ?? data.body ?? `${body.action ?? "updated"} ${title}`),
+    text: [data.identifier, data.description ?? data.body ?? `${body.action ?? "updated"} ${title}`].filter(Boolean).join("\n"),
     canonicalUrl: data.url,
     externalScopeId: String(data.teamId ?? data.projectId ?? data.team?.id ?? ""),
     occurredAt: date(data.updatedAt ?? body.webhookTimestamp ?? data.createdAt),

@@ -4,6 +4,8 @@ import type { AgentPrincipal } from "./agent-auth.js";
 import { createHash } from "node:crypto";
 import type { AgentEvent, ResolveContextRequest, ResolveContextResponse, AcknowledgeReceiptRequest } from "termyte/protocol";
 import type { ReportOutcomeRequest } from "termyte/protocol";
+import { transaction } from "./db.js";
+import { attachAgentOutcome, linearKey } from "./work-threads.js";
 
 export async function storeAlphaEvents(db: Database, principal: AgentPrincipal, events: AgentEvent[]): Promise<{ accepted: string[]; existing: string[] }> {
   const accepted: string[] = [];
@@ -72,8 +74,55 @@ function alphaMemoryType(eventType: string): "decision" | "requirement" | "probl
 
 export async function resolveAlphaContext(db: Database, principal: AgentPrincipal, input: ResolveContextRequest): Promise<ResolveContextResponse> {
   const references = input.explicit_references;
+  const requestedLinearKey = [...references, input.request_text].map(linearKey).find((value): value is string => value !== null);
+  if (requestedLinearKey) {
+    const thread = (await db.query<{ id: string; version: number }>(`
+      SELECT id, version FROM work_threads
+      WHERE workspace_id=$1 AND linear_issue_key=$2 AND status <> 'archived'
+    `, [principal.workspaceId, requestedLinearKey])).rows[0];
+    if (!thread) return { schema_version: 3, state: "abstained", receipt_id: randomUUID(), code: "no_match", message: `No Work Thread found for ${requestedLinearKey}.` };
+    const claims = (await db.query<{
+      item_id: string; claim_type: "requirement" | "constraint" | "decision" | "attempt" | "fact" | "outcome"; content: string;
+      status: "active" | "conflicting"; source_record_id: string; provider: "agent" | "slack" | "github" | "linear";
+      title: string; source_url: string | null; event_at: Date;
+    }>(`
+      SELECT claim.id AS item_id,claim.claim_type,claim.content,claim.status,
+             source.id AS source_record_id,source.source_type AS provider,
+             COALESCE(source.metadata->>'title',source.record_type) AS title,
+             source.source_url,source.event_at
+      FROM claims claim
+      JOIN source_records source ON source.id=claim.source_record_id AND source.workspace_id=claim.workspace_id
+      LEFT JOIN connector_connections connection ON connection.id=source.connector_connection_id
+      WHERE claim.workspace_id=$1 AND claim.work_thread_id=$2
+        AND claim.status IN ('active','conflicting') AND source.revoked_at IS NULL
+        AND (source.connector_connection_id IS NULL OR connection.status='active')
+      ORDER BY CASE claim.claim_type WHEN 'constraint' THEN 0 WHEN 'requirement' THEN 1 WHEN 'attempt' THEN 2 WHEN 'decision' THEN 3 WHEN 'outcome' THEN 4 ELSE 5 END,
+               source.event_at DESC,claim.id
+    `, [principal.workspaceId, thread.id])).rows;
+    if (claims.length === 0) return { schema_version: 3, state: "abstained", receipt_id: randomUUID(), code: "no_authorized_sources", message: `No authorized evidence remains for ${requestedLinearKey}.` };
+    const budget = input.cloud_token_budget * 4;
+    let used = 0;
+    const included = claims.filter((claim) => {
+      if (used + claim.content.length > budget && used > 0) return false;
+      used += claim.content.length;
+      return true;
+    });
+    const response: ResolveContextResponse = {
+      schema_version: 3, state: "context", receipt_id: randomUUID(), task_mode: input.task_mode_hint ?? "general",
+      omitted_count: claims.length - included.length, expires_at: Date.now() + 300_000,
+      items: included.map((claim) => ({
+        item_id: claim.item_id, type: claim.claim_type, text: claim.content,
+        status: claim.status === "conflicting" ? "conflicting" : "observed", confidence: 1,
+        task_relevance: 100, company_relevance: 80,
+        task_reason: `Explicitly linked to ${requestedLinearKey}`, company_reason: "Retained source evidence",
+        source: { source_record_id: claim.source_record_id, provider: claim.provider, title: claim.title, ...(claim.source_url ? { url: claim.source_url } : {}), occurred_at: claim.event_at.getTime() },
+      })),
+    };
+    await db.query(`INSERT INTO alpha_receipts (id,workspace_id,agent_identity_id,packet_json,expires_at,work_thread_id,work_thread_version) VALUES ($1,$2,$3,$4,to_timestamp($5 / 1000.0),$6,$7)`, [response.receipt_id, principal.workspaceId, principal.agentIdentityId, JSON.stringify(response), response.expires_at, thread.id, thread.version]);
+    return response;
+  }
   const result = await db.query<{
-    id: string; provider: "agent" | "slack" | "github"; record_type: string; content: string; repository: string | null; branch: string | null; source_url: string | null; event_at: Date;
+    id: string; provider: "agent" | "slack" | "github" | "linear"; record_type: string; content: string; repository: string | null; branch: string | null; source_url: string | null; event_at: Date;
   }>(`
     SELECT id, source_type AS provider, record_type, content, repository_id AS repository, branch, source_url, event_at
     FROM source_records
@@ -107,21 +156,24 @@ export async function acknowledgeAlphaReceipt(db: Database, principal: AgentPrin
 }
 
 export async function storeAlphaOutcome(db: Database, principal: AgentPrincipal, input: ReportOutcomeRequest): Promise<void> {
-  await db.query("BEGIN");
-  try {
-    let session = (await db.query<{ id: string; repository: string; branch: string | null }>(`
+  await transaction(db, async (client) => {
+    let session = (await client.query<{ id: string; repository: string; branch: string | null }>(`
       SELECT id, repository_id AS repository, branch FROM agent_sessions
       WHERE workspace_id = $1 AND external_session_id = $2
       FOR UPDATE
     `, [principal.workspaceId, input.agent_session_id])).rows[0];
     if (!session) {
       session = { id: randomUUID(), repository: "unknown", branch: null };
-      await db.query(`INSERT INTO agent_sessions (id, workspace_id, external_session_id, agent_type, repository_id, status, started_at) VALUES ($1, $2, $3, $4, $5, 'active', now()) ON CONFLICT (workspace_id, external_session_id) DO NOTHING`, [session.id, principal.workspaceId, input.agent_session_id, principal.platform, session.repository]);
+      await client.query(`INSERT INTO agent_sessions (id, workspace_id, external_session_id, agent_type, repository_id, status, started_at) VALUES ($1, $2, $3, $4, $5, 'active', now()) ON CONFLICT (workspace_id, external_session_id) DO NOTHING`, [session.id, principal.workspaceId, input.agent_session_id, principal.platform, session.repository]);
     }
     if (session) {
-      await db.query(`UPDATE agent_sessions SET completed_at = to_timestamp($2 / 1000.0), status = $3::text, summary_json = jsonb_build_object('work_performed', jsonb_build_array($4::text), 'decisions', '[]'::jsonb, 'changes', '[]'::jsonb, 'problems', '[]'::jsonb, 'failed_attempts', '[]'::jsonb, 'current_status', $3::text, 'unfinished_work', '[]'::jsonb, 'next_steps', '[]'::jsonb, 'references', '[]'::jsonb) WHERE id = $1`, [session.id, input.reported_at, input.status, input.summary]);
-      await db.query(`INSERT INTO source_records (id, workspace_id, source_type, external_id, record_type, repository_id, branch, content, event_at) VALUES ($1, $2, 'agent', $3, 'outcome', $4, $5, $6, to_timestamp($7 / 1000.0)) ON CONFLICT (workspace_id, source_type, external_id) DO NOTHING`, [randomUUID(), principal.workspaceId, `outcome:${input.idempotency_key}`, session.repository, session.branch, input.summary, input.reported_at]);
+      await client.query(`UPDATE agent_sessions SET completed_at = to_timestamp($2 / 1000.0), status = $3::text, summary_json = jsonb_build_object('work_performed', jsonb_build_array($4::text), 'decisions', '[]'::jsonb, 'changes', '[]'::jsonb, 'problems', '[]'::jsonb, 'failed_attempts', '[]'::jsonb, 'current_status', $3::text, 'unfinished_work', '[]'::jsonb, 'next_steps', '[]'::jsonb, 'references', '[]'::jsonb) WHERE id = $1`, [session.id, input.reported_at, input.status, input.summary]);
+      const sourceId = randomUUID();
+      const inserted = await client.query(`INSERT INTO source_records (id, workspace_id, source_type, external_id, record_type, repository_id, branch, content, event_at) VALUES ($1, $2, 'agent', $3, 'outcome', $4, $5, $6, to_timestamp($7 / 1000.0)) ON CONFLICT (workspace_id, source_type, external_id) DO NOTHING RETURNING id`, [sourceId, principal.workspaceId, `outcome:${input.idempotency_key}`, session.repository, session.branch, input.summary, input.reported_at]);
+      if (inserted.rowCount === 1 && input.receipt_id) {
+        const receipt = (await client.query<{ work_thread_id: string | null }>(`SELECT work_thread_id FROM alpha_receipts WHERE id=$1 AND workspace_id=$2 AND agent_identity_id=$3`, [input.receipt_id, principal.workspaceId, principal.agentIdentityId])).rows[0];
+        if (receipt?.work_thread_id) await attachAgentOutcome(client, receipt.work_thread_id, sourceId, input.summary);
+      }
     }
-    await db.query("COMMIT");
-  } catch (error) { await db.query("ROLLBACK"); throw error; }
+  });
 }

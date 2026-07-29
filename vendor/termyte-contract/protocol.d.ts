@@ -24,6 +24,7 @@ export declare const SourceProviderSchema: z.ZodEnum<{
     local: "local";
     github: "github";
     slack: "slack";
+    linear: "linear";
     agent: "agent";
 }>;
 export declare const DeliveryStatusSchema: z.ZodEnum<{
@@ -191,6 +192,7 @@ export declare const ResolvedContextResponseSchema: z.ZodObject<{
             provider: z.ZodEnum<{
                 github: "github";
                 slack: "slack";
+                linear: "linear";
                 agent: "agent";
             }>;
             title: z.ZodString;
@@ -258,6 +260,7 @@ export declare const ResolveContextResponseSchema: z.ZodDiscriminatedUnion<[z.Zo
             provider: z.ZodEnum<{
                 github: "github";
                 slack: "slack";
+                linear: "linear";
                 agent: "agent";
             }>;
             title: z.ZodString;

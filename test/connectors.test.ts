@@ -11,9 +11,10 @@ import {
 
 describe("connector security", () => {
   it("exposes the exact provider webhook aliases", async () => {
-    const app = createApp({ query: async () => ({ rows: [], rowCount: 0 }) } as any, "x".repeat(32), { connectorRuntime: { encryptionKey: Buffer.alloc(32), webhookSecrets: { github: "github-secret", slack: "slack-secret" } } });
+    const app = createApp({ query: async () => ({ rows: [], rowCount: 0 }) } as any, "x".repeat(32), { connectorRuntime: { encryptionKey: Buffer.alloc(32), webhookSecrets: { github: "github-secret", slack: "slack-secret", linear: "linear-secret" } } });
     expect((await app.request("/webhooks/github", { method: "POST", body: "{}" })).status).toBe(401);
     expect((await app.request("/webhooks/slack", { method: "POST", body: "{}" })).status).toBe(401);
+    expect((await app.request("/webhooks/linear", { method: "POST", body: "{}" })).status).toBe(401);
   });
 
   it("encrypts credentials with authenticated encryption", () => {
@@ -62,6 +63,16 @@ describe("connector security", () => {
     });
     expect(verifyConnectorWebhook("slack", body, headers, secret, now)).toBe(true);
     expect(verifyConnectorWebhook("slack", body, headers, secret, now + 301_000)).toBe(false);
+  });
+
+  it("verifies Linear signatures over raw bytes and rejects replay", () => {
+    const now = 1_800_000_000_000;
+    const body = JSON.stringify({ webhookTimestamp: now, type: "Issue", data: { id: "issue-1" } });
+    const signature = createHmac("sha256", "linear-signing-secret").update(body).digest("hex");
+    const headers = new Headers({ "linear-signature": signature });
+    expect(verifyConnectorWebhook("linear", body, headers, "linear-signing-secret", now)).toBe(true);
+    expect(verifyConnectorWebhook("linear", `${body} `, headers, "linear-signing-secret", now)).toBe(false);
+    expect(verifyConnectorWebhook("linear", body, headers, "linear-signing-secret", now + 60_001)).toBe(false);
   });
 
 });
@@ -160,6 +171,31 @@ describe("connector normalization", () => {
       entityKey: "T1:C1:1800000000.000001",
       providerEventId: "Ev-edit",
       text: "Edited reply",
+    });
+  });
+
+  it("normalizes Linear issues with stable workspace and team identity", () => {
+    expect(normalizeConnectorWebhook("linear", {
+      action: "update",
+      type: "Issue",
+      organizationId: "linear-workspace-1",
+      webhookTimestamp: 1_800_000_000_000,
+      data: {
+        id: "issue-id-1",
+        identifier: "LIN-42",
+        title: "Refresh tokens log users out",
+        description: "Keep enterprise SSO expiry unchanged.",
+        url: "https://linear.app/acme/issue/LIN-42/refresh-token",
+        teamId: "team-1",
+        updatedAt: "2027-01-15T08:00:00.000Z",
+      },
+    }, new Headers({ "linear-delivery": "delivery-1" }))).toMatchObject({
+      provider: "linear",
+      externalAccountId: "linear-workspace-1",
+      externalId: "Issue:LIN-42",
+      externalScopeId: "team-1",
+      title: "Refresh tokens log users out",
+      canonicalUrl: "https://linear.app/acme/issue/LIN-42/refresh-token",
     });
   });
 
