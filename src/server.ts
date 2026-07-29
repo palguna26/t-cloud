@@ -42,6 +42,7 @@ import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
 import { enqueueExtractionJob, startWorkerLoop } from "./worker.js";
+import { migrate } from "./migrate.js";
 
 type Variables = { principal: AgentPrincipal; humanUserId: string; requestId: string };
 const SessionIngestSchema = z.object({
@@ -311,6 +312,7 @@ function validBrowserOrigin(origin: string | undefined, publicAppUrl = "http://l
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const config = loadConfig();
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);
+  await migrate(db);
   const webAuth = config.SUPABASE_URL && config.SUPABASE_ANON_KEY
     ? { supabaseUrl: config.SUPABASE_URL, anonKey: config.SUPABASE_ANON_KEY }
     : undefined;
