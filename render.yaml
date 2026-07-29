@@ -37,6 +37,14 @@ services:
         sync: false
       - key: SLACK_SIGNING_SECRET
         sync: false
+      - key: LINEAR_CLIENT_ID
+        sync: false
+      - key: LINEAR_CLIENT_SECRET
+        sync: false
+      - key: LINEAR_WEBHOOK_SECRET
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
 
   - type: worker
     name: termyte-worker
@@ -53,4 +61,6 @@ services:
       - key: PUBLIC_APP_URL
         sync: false
       - key: CONNECTOR_ENCRYPTION_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
         sync: false
