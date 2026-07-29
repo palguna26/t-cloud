@@ -82,6 +82,18 @@ export async function runOnce(db: Database, config: ExtractionConfig): Promise<b
   return true;
 }
 
+export function startWorkerLoop(db: Database, config: ExtractionConfig, intervalMs = 5_000): () => void {
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  const poll = async () => {
+    try { while (!stopped && await runOnce(db, config)) {} }
+    catch (error) { console.error(`Worker poll failed: ${error instanceof Error ? error.message : String(error)}`); }
+    if (!stopped) timer = setTimeout(poll, intervalMs);
+  };
+  void poll();
+  return () => { stopped = true; if (timer) clearTimeout(timer); };
+}
+
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const config = loadConfig();
   const db = createDatabase(config.DATABASE_URL, config.DATABASE_POOL_MAX);

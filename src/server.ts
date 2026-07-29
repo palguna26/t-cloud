@@ -41,7 +41,7 @@ import { createAgentIdentity, createWorkspace, getWorkThread, listAgents, listWo
 import { ConflictError, ForbiddenError, NotFoundError } from "./errors.js";
 import { consumeRateLimit } from "./rate-limit.js";
 import { ServiceMetrics } from "./metrics.js";
-import { enqueueExtractionJob } from "./worker.js";
+import { enqueueExtractionJob, startWorkerLoop } from "./worker.js";
 
 type Variables = { principal: AgentPrincipal; humanUserId: string; requestId: string };
 const SessionIngestSchema = z.object({
@@ -336,4 +336,11 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     } : undefined,
   });
   serve({ fetch: app.fetch, port: config.PORT });
+  if (config.OPENROUTER_API_KEY) startWorkerLoop(db, {
+    apiKey: config.OPENROUTER_API_KEY,
+    model: config.OPENROUTER_MODEL,
+    baseUrl: config.OPENROUTER_BASE_URL,
+    timeoutMs: config.OPENROUTER_TIMEOUT_MS,
+    extractionVersion: config.EXTRACTION_VERSION,
+  });
 }

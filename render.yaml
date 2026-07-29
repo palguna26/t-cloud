@@ -45,22 +45,3 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
-
-  - type: worker
-    name: termyte-worker
-    runtime: docker
-    plan: starter
-    dockerCommand: node dist/worker.js
-    maxShutdownDelaySeconds: 30
-    envVars:
-      - fromGroup: termyte-shared
-      - key: DATABASE_URL
-        sync: false
-      - key: DATABASE_POOL_MAX
-        value: "5"
-      - key: PUBLIC_APP_URL
-        sync: false
-      - key: CONNECTOR_ENCRYPTION_KEY
-        sync: false
-      - key: OPENROUTER_API_KEY
-        sync: false

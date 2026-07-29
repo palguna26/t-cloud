@@ -2,7 +2,7 @@
 
 ## Deploy
 
-Termyte Cloud runs an API and a worker against PostgreSQL. Run the ordered SQL migrations before starting either process.
+Termyte Cloud runs as one web service against PostgreSQL. When OpenRouter is configured, the API process also drains extraction jobs. Run the ordered SQL migrations before starting it.
 
 Required configuration:
 
