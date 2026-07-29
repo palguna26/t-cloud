@@ -9,7 +9,7 @@ services:
     name: termyte-api
     runtime: docker
     plan: starter
-    dockerCommand: sh -c "node dist/migrate.js && node dist/server.js"
+    dockerCommand: node dist/server.js
     healthCheckPath: /health
     maxShutdownDelaySeconds: 30
     envVars:
